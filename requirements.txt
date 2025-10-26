@@ -1,0 +1,7 @@
+php
+
+pandas
+boto3
+pyyaml
+psycopg2-binary
+s3fs
