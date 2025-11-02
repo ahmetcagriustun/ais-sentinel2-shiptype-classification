@@ -1,0 +1,77 @@
+# config.yaml
+sentinel_hub:
+  auth_url: "https://services.sentinel-hub.com/oauth/token"
+  catalog_url: "https://services.sentinel-hub.com/api/v1/catalog/search"
+  client_id: "3ce0c5af-9b12-4342-8b12-d93138da0e1c"         # <--- Enter your Sentinel Hub client_id here
+  client_secret: "Fol4L73WHlH9U1HrrDN7ASb2nV6bnRZF" # <--- Enter your Sentinel Hub client_secret here
+
+ais:
+  base_url: "http://aisdata.ais.dk"
+  
+project:
+  start_date: "2025-05-01T00:00:00Z"      # ISO-UTC
+  end_date:   "2025-05-01T23:59:59Z"      # ISO-UTC
+  # [minLon, minLat, maxLon, maxLat]
+  region_bbox: [2.76, 53.02, 19.29, 59.79]
+
+database:                      # used by: main.py (AIS parse, patches), utils.db_utils, patches_sentinel2_from_db.py
+  host: "ais-sentinel2-2.c70wuo2yyclg.eu-central-1.rds.amazonaws.com"
+  port: 5432
+  dbname: "postgres"
+  user: "acustun"
+  password: "Ac18801880!"
+
+copernicus:                    # used by: utils/sentinel2_download.py (s2.download-names)
+  username: "ahmetcagriustun@gmail.com"
+  password: "Aslusi2021!!" 
+
+s3:                            # used by: main.py steps, utils.*, cleaner, training
+  bucket: "ais-sentinel2-dataset"
+  region: "eu-central-1"       # optional; remove if you prefer env/instance role
+
+  # (optional static credentials; you can leave this blank if you are using IAM/Role)
+  access_key_id: ""
+  secret_access_key: ""
+
+  # Sources
+  raw_data_prefix: "AIS/"                    # AIS ZIPs (ais.download / ais.parse-s3)
+  sentinel2_prefix: "sentinel2/"                  # SAFE .zip (s2.download-names / s2.index-zip-metadata)
+
+  # Patches
+  patches_prefix: "training-patches/"    # used by: patches_sentinel2_from_db.py, cleaner
+  training_dataset_prefix: "training-patches/"  
+  rebucketed_prefix: "training-patches-ship-type"       # used by: rebucket_by_ship_type.py (source)
+  cv_dataset_prefix: "training-patches-ship-type/"  # used by: train_cnn3-3_resnet34.py
+
+  # Re-bucket (destination)
+  dest_training_by_type_prefix: "training-patches-ship-type/"         # used by: rebucket_by_ship_type.py
+
+  # Results & reports
+  results_prefix: "results/"                     # training outputs, cleaner CSV report
+  # Cleaner optional aliases
+  images_prefix: ""                              # leave empty to default to training_patches_prefix
+  cloudy_out_prefix: "cloudy_images/"
+
+# Training hyperparameters — used by: train_cnn3-3_resnet34.py
+training:
+  epochs: 20
+  batch_size: 64
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  num_workers: 4
+  image_size: 128
+  seed: 42
+  early_stopping_patience: 7
+  mixed_precision: true
+  train_val_test_split: [0.8, 0.1, 0.1]
+
+# Band order — used by: train_cnn3-3_resnet18.py
+bands_order: ["B02", "B03", "B04", "B08"]
+
+# Cleaner thresholds — used by: clean_cloudy_s3.py
+quality:
+  tci_brightness_threshold: 0.80    # --bright-thresh
+  max_cloud_ratio: 0.30              # --max-cloud-ratio
+  vis_brightness_threshold: 0.75     # multiband VIS
+  nir_threshold: 0.65                # multiband NIR
+  ndvi_upper_for_cloud: 0.25         # multiband NDVI upper bound

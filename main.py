@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-# main.py
-# -*- coding: utf-8 -*-
 """
 CLI for AIS–Sentinel-2 pipeline (uses existing utils as-is; no changes to utils)
 
@@ -13,7 +10,7 @@ Commands
 - s2.build-download-index-geom   : run SQL to create/populate sentinel_download_index_geom
 - ais.build-list                 : run SQL to create ais_download_list
 - ais.download                   : download AIS zips to S3 by dates from ais_download_list
-- ais.parse-s3                   : iterate S3 AIS ZIPs and insert rows into Postgres in batches (reads ais.batch_size)
+- ais.parse-s3                   : iterate S3 AIS ZIPs and insert rows into Postgres via COPY
 - db.exec-sql                    : execute a single SQL file on the configured database
                                     python main.py db.exec-sql --sql-file sql/sql_create_point_geom.sql
                                     python main.py db.exec-sql --sql-file sql/sql_create_sensing_time_without_tz.sql
@@ -43,6 +40,7 @@ Commands
                       --dest   s3://ais-sentinel2-dataset/training/patches_rebucketed/ \
                       --map-file config/ship_type_map.yaml \
                       --dry-run
+"""
 
 import os
 import glob
@@ -50,27 +48,24 @@ import sys
 import subprocess
 import argparse
 
-# === Use your existing utils (same imports as your old main.py) ===
+
 from utils.config_utils import load_config
 from utils.db_utils import (
     insert_dicts_to_table,
     create_table,
+    ensure_table_exists, 
     create_pg_connection,
     execute_sql_file,
 )
 from utils.db_utils import get_product_names_from_postgres  # if you still use it elsewhere
 from utils.sentinel2_download import (
     download_and_upload_products_by_name,
-    process_zip_files_in_s3_streaming,   # <- same function you used before
+    process_zip_files_in_s3_streaming,
 )
 from utils.ais_download import download_ais_zips_from_dates
 from utils.s3_utils import list_s3_zip_files
 from utils.ais_parser import process_zip_s3_to_pg_disk
 
-
-# -----------------------------
-# Commands
-# -----------------------------
 def cmd_s2_select_file(args):
     sql_file = args.sql_file
     if not os.path.isfile(sql_file):
@@ -86,7 +81,6 @@ def cmd_s2_select_file(args):
 
 
 def cmd_s2_download(args):
-    # 1) Product names (WITHOUT .SAFE) from Postgres
     product_names = get_product_names_from_postgres(
         config_path=args.config,
         table_name=args.table,
@@ -97,7 +91,6 @@ def cmd_s2_download(args):
         print("[s2.download] No products found, exiting.")
         return
 
-    # 2) Download + upload to S3
     download_and_upload_products_by_name(
         product_name_list=product_names,
         config_path=args.config,
@@ -107,12 +100,6 @@ def cmd_s2_download(args):
 
 
 def cmd_s2_build_download_index(args):
-    """
-    - Read S3 config
-    - Create table if not exists
-    - process_zip_files_in_s3_streaming(...) to extract sensing_time
-    - insert rows into DB
-    """
     cfg = load_config(args.config)
 
     # S3 config
@@ -126,10 +113,9 @@ def cmd_s2_build_download_index(args):
         s3_kwargs["aws_access_key_id"] = s3_conf["access_key_id"]
         s3_kwargs["aws_secret_access_key"] = s3_conf["secret_access_key"]
 
-    # DB connect
     conn = create_pg_connection(cfg["database"])
     try:
-        # Table + schema
+
         table_name = args.table
         schema_sql = f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
@@ -140,13 +126,13 @@ def cmd_s2_build_download_index(args):
         """
         create_table(conn, table_name, schema_sql)
 
-        # Scan S3
+
         print(f"[s2.build-download-index] Scanning s3://{s3_bucket}/{s3_prefix} …")
         results = process_zip_files_in_s3_streaming(
             s3_bucket, s3_prefix, s3_kwargs, conn, table_name
         )
 
-        # Insert
+
         if results:
             insert_dicts_to_table(conn, table_name, results)
             print(f"[s2.build-download-index] Inserted {len(results)} rows into {table_name}.")
@@ -213,24 +199,14 @@ def cmd_ais_download(args):
     )
     print("[ais.download] DONE.")
 
-
 def cmd_ais_parse_s3(args):
-    """
-    Iterate over AIS ZIPs under S3 raw_data_prefix and insert CSV rows into Postgres
-    using utils.ais_parser.process_zip_s3_to_pg_disk. Batch size is read from config.ais.batch_size,
-    but can be overridden via --batch-size.
-    """
     cfg = load_config(args.config)
-
-    # ---- DB
     db_conf = cfg["database"]
     conn = create_pg_connection(db_conf)
 
-    # ---- S3
     s3_conf = cfg["s3"]
     s3_bucket = s3_conf["bucket"]
-    # Use raw_data_prefix from config as requested
-    ais_prefix = args.prefix or s3_conf.get("raw_data_prefix", "raw-data/")
+    ais_prefix = args.prefix or s3_conf.get("raw_data_prefix", "AIS/")
     s3_kwargs = {}
     if s3_conf.get("region"):
         s3_kwargs["region_name"] = s3_conf["region"]
@@ -238,32 +214,18 @@ def cmd_ais_parse_s3(args):
         s3_kwargs["aws_access_key_id"] = s3_conf["access_key_id"]
         s3_kwargs["aws_secret_access_key"] = s3_conf["secret_access_key"]
 
-    # ---- Batch size from config ais.batch_size (default 10000)
-    cfg_batch = (cfg.get("ais") or {}).get("batch_size", 10000)
-    batch_size = int(args.batch_size or cfg_batch)
-
-    # ---- Target table
     table_name = args.table
 
     try:
-        # List S3 ZIPs
         all_zips = list_s3_zip_files(s3_bucket, ais_prefix, s3_kwargs)
         print(f"[ais.parse-s3] Found {len(all_zips)} ZIP files under s3://{s3_bucket}/{ais_prefix}")
-
         for s3_key in all_zips:
-            print(f"[ais.parse-s3] Processing: s3://{s3_bucket}/{s3_key} (batch_size={batch_size})")
-            process_zip_s3_to_pg_disk(
-                s3_bucket, s3_key, conn, table_name, s3_kwargs, batch_size=batch_size
-            )
-
+            print(f"[ais.parse-s3] Processing: s3://{s3_bucket}/{s3_key}")
+            process_zip_s3_to_pg_disk(s3_bucket, s3_key, conn, table_name, s3_kwargs)
         print("[ais.parse-s3] All AIS records inserted!")
     finally:
         conn.close()
 
-
-# -----------------------------
-# Generic DB SQL executors
-# -----------------------------
 def _open_pg_conn_from_cfg(cfg_path: str):
     """Open a Postgres connection using database section in config.yaml."""
     cfg = load_config(cfg_path)
@@ -288,17 +250,11 @@ def cmd_db_exec_sql(args):
 
 
 def cmd_db_exec_sql_batch(args):
-    """
-    Execute all SQL files under a folder in alphanumeric order.
-    - Supports .sql and .txt
-    - Use --pattern to narrow (e.g., 'create_*', 'idx_*', '2025_*')
-    - With --single-transaction, all files run atomically (if compatible)
-    """
+
     folder = args.folder
     if not os.path.isdir(folder):
         raise SystemExit(f"[db.exec-sql-batch] Folder not found: {folder}")
 
-    # Build glob patterns for .sql and .txt
     if args.pattern:
         stems = [args.pattern] if isinstance(args.pattern, str) else args.pattern
         patterns = []
@@ -335,15 +291,8 @@ def cmd_db_exec_sql_batch(args):
     finally:
         conn.close()
 
-
-# -----------------------------
-# Patches builder (delegates to python -m utils.patches_sentinel2_from_db)
-# -----------------------------
 def cmd_patches_build(args):
-    """
-    Delegate to 'python -m utils.patches_sentinel2_from_db' to keep behavior identical
-    to your previous workflow. We pass through common flags.
-    """
+
     cmd = [
         sys.executable, "-m", "utils.patches_sentinel2_from_db",
         "--config", args.config,
@@ -362,15 +311,7 @@ def cmd_patches_build(args):
     subprocess.run(cmd, check=True)
     print("[patches.build] DONE.")
 
-
-# -----------------------------
-# Clean cloudy patches (delegates to python -m utils.clean_cloudy_s3)
-# -----------------------------
 def cmd_patches_clean_cloudy(args):
-    """
-    Delegate to 'python -m utils.clean_cloudy_s3'.
-    Passes through thresholds and optional extras.
-    """
     cmd = [
         sys.executable, "-m", "utils.clean_cloudy_s3",
         "--config", args.config,  # if the script reads config; harmless otherwise
@@ -384,14 +325,7 @@ def cmd_patches_clean_cloudy(args):
     subprocess.run(cmd, check=True)
     print("[patches.clean-cloudy] DONE.")
 
-# -----------------------------
-# Re-bucket by ship type (delegates to python -m utils.rebucket_by_ship_type)
-# -----------------------------
 def cmd_patches_rebucket(args):
-    """
-    Delegate to 'python -m utils.rebucket_by_ship_type' (and fall back to
-    'utils.rebucked_by_ship_type' if needed). All flags after --extra are forwarded verbatim.
-    """
     base_cmd = [sys.executable, "-m", "utils.rebucket_by_ship_type"]
     fallback_cmd = [sys.executable, "-m", "utils.rebucked_by_ship_type"]  # in case repo uses old name
 
@@ -417,9 +351,6 @@ def cmd_patches_rebucket(args):
     subprocess.run(forwarded_fb, check=True)
     print("[patches.rebucket] DONE (fallback).")
 
-# -----------------------------
-# Argparse
-# -----------------------------
 def build_parser():
     p = argparse.ArgumentParser(
         description="AIS–Sentinel-2 pipeline CLI (uses existing utils, no changes)",
@@ -486,14 +417,12 @@ def build_parser():
 
     # ais.parse-s3
     ap = sub.add_parser("ais.parse-s3",
-                        help="Parse AIS ZIPs from S3 raw_data_prefix and insert into Postgres with batching.",
+                        help="Parse AIS ZIPs from S3 raw_data_prefix and insert into Postgres using fast COPY.",
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--table", default="ship_raw_data",
                     help="Target Postgres table to insert AIS rows.")
     ap.add_argument("--prefix", default=None,
                     help="Override S3 prefix; default from config.s3.raw_data_prefix or 'raw-data/'.")
-    ap.add_argument("--batch-size", type=int, default=None,
-                    help="Override config.ais.batch_size (if not set, defaults to 10000).")
     ap.set_defaults(func=cmd_ais_parse_s3)
 
     # db.exec-sql (single file)

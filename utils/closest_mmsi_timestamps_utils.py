@@ -1,15 +1,10 @@
 import psycopg2
 
 def batch_insert_closest_mmsi_timestamps(db_conf, verbose=True, create_table_if_not_exists=True):
-    """
-    closest_mmsi_timestamps tablosunu sadece ilk çağrıda oluşturur (opsiyonel).
-    Her Sentinel-2 api_id için batch INSERT ile verileri ekler.
-    """
     conn = psycopg2.connect(**db_conf)
     cur = conn.cursor()
 
     if create_table_if_not_exists:
-        # Tablo zaten var mı kontrol et, yoksa oluştur
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables
@@ -63,7 +58,6 @@ def batch_insert_closest_mmsi_timestamps(db_conf, verbose=True, create_table_if_
             if verbose:
                 print("Table closest_mmsi_timestamps already exists. Will append to it.")
 
-    # Bütün api_id'leri al
     cur.execute("SELECT DISTINCT api_id FROM public.sentinel_download_index_geom;")
     api_ids = [row[0] for row in cur.fetchall()]
 

@@ -31,16 +31,7 @@ def ensure_token_valid(token_time, max_age=600):
     return (time.time() - token_time) < (max_age - 60)
 
 def find_product_id(product_name, session, max_retries=5, retry_wait=10):
-    """
-    Queries Copernicus API for product id, with retry for server errors.
-    Args:
-        product_name (str): Product name WITHOUT .SAFE
-        session: requests.Session
-        max_retries (int): Number of retries for 5xx errors.
-        retry_wait (int): Seconds to wait between retries.
-    Returns:
-        str or None: Product ID if found.
-    """
+
     url = f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products?$filter=Name eq '{product_name}.SAFE'"
     for attempt in range(max_retries):
         try:
@@ -76,10 +67,7 @@ def download_product_zip(product_id, product_name, session, out_dir):
     return path
 
 def s3_file_exists(bucket, s3_prefix, filename, s3_kwargs):
-    """
-    Checks if a file exists in S3 bucket under the given prefix.
-    Returns True if exists, False otherwise.
-    """
+
     if not s3_prefix.endswith("/"):
         s3_prefix += "/"
     s3_key = s3_prefix + filename
@@ -107,15 +95,7 @@ def download_and_upload_products_by_name(
     config_path="config.yaml",
     out_dir="./downloads"
 ):
-    """
-    Downloads Sentinel-2 products by product name list and uploads them to S3.
-    Skips download if file already exists in S3. Includes retry for API errors.
 
-    Args:
-        product_name_list (list): List of product names (WITHOUT .SAFE).
-        config_path (str): Path to config.yaml.
-        out_dir (str): Local directory to save temporary .zip files.
-    """
     config = load_config(config_path)
     cop = config["copernicus"]
     s3_conf = config["s3"]
@@ -160,13 +140,6 @@ def download_and_upload_products_by_name(
             print(f"{prod_name} finished and local file deleted.\n")
         except Exception as e:
             print(f"Download/upload failed for {prod_name}: {e}")
-
-        # Optionally: Batch sleep every N downloads to avoid overloading the API
-        # if idx % 100 == 0:
-        #     print("Sleeping 60 seconds to avoid API limits...")
-        #     time.sleep(60)
-
-# --- EXTRACT SENSING TIME FROM XML ---
 def extract_sensing_time(xml_content):
     try:
         root = ET.fromstring(xml_content)
@@ -216,8 +189,6 @@ def process_zip_files_in_s3_streaming(s3_bucket, s3_prefix, s3_kwargs, conn, tab
                     print(f"Error inserting {file_name}: {e}")
     print(f"Inserted {inserted_count} records to DB.")
 
-# utils/sentinel2_download.py  (append these helpers)
-
 def ensure_sentinel_download_index_table(conn, table_name: str = "public.sentinel_download_index"):
     """
     Create the 'sentinel_download_index' table if it does not exist.
@@ -241,26 +212,13 @@ def build_sentinel_download_index(
     table_name: str = "public.sentinel_download_index",
     s3_prefix_override: str | None = None
 ):
-    """
-    End-to-end builder for the Sentinel-2 download index:
-    - Ensures the target table exists (idempotent DDL).
-    - Scans S3 under the configured sentinel2_prefix (or override).
-    - Streams each SAFE.zip, extracts MTD_TL.xml, parses SENSING_TIME.
-    - Inserts rows into the table (idempotent on file_name PRIMARY KEY).
 
-    Notes
-    -----
-    This function reuses `process_zip_files_in_s3_streaming`, which already
-    performs per-record INSERTs; here we only ensure the table exists and
-    pass through S3/DB configuration in a single, reproducible entry point.
-    """
     import psycopg2
 
     cfg = load_config(config_path)
     s3_conf = cfg.get("s3", {})
     db_conf = cfg.get("database", {})
 
-    # --- S3 config
     bucket = s3_conf["bucket"]
     s3_prefix = s3_prefix_override or s3_conf.get("sentinel2_prefix", "sentinel2/")
     s3_kwargs = {}
@@ -270,7 +228,7 @@ def build_sentinel_download_index(
         s3_kwargs["aws_access_key_id"] = s3_conf["access_key_id"]
         s3_kwargs["aws_secret_access_key"] = s3_conf["secret_access_key"]
 
-    # --- DB connect
+
     conn = psycopg2.connect(
         host=db_conf["host"],
         port=db_conf.get("port", 5432),

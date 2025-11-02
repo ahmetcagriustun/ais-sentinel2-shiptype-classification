@@ -1,36 +1,3 @@
-# utils/rebucket_auto.py
-# -*- coding: utf-8 -*-
-"""
-Auto-rebucket S3 patches by Ship Type with zero runtime arguments.
-
-Behavior
---------
-- Reads S3 config and `training_dataset_prefix` from config.yaml using utils.config_utils.load_config.
-- Scans every object under `training_dataset_prefix` (same bucket).
-- Infers ship type from filename or path.
-- Copies each object to: s3://<bucket>/training-patches-ship-type/<ShipType>/<basename>
-- Does NOT delete or overwrite source. If destination already exists, it skips copying.
-- No CLI flags. Running this module performs the operation.
-
-Assumptions
------------
-config.yaml structure includes at least:
-  s3:
-    bucket: <your-bucket>
-    region: <optional>
-    training_dataset_prefix: <source/prefix/>
-
-You may also optionally add:
-  s3:
-    dest_training_by_type_prefix: training-patches-ship-type/
-
-Filename → ShipType inference
------------------------------
-1) If basename starts with '<ShipType>_' (letters/spaces/hyphens/underscores) -> use that token.
-2) Else, first or second path segment under the source prefix that looks like a class name.
-3) Otherwise 'unclassified'.
-"""
-
 import os
 import re
 import sys

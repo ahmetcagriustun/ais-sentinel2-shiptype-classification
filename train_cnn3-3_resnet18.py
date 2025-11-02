@@ -1,14 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Train CNN with stratified (no-group) cross-validation on multiband Sentinel-2 patches.
-Leisure merge: Sailing + Pleasure -> Leisure (5-class setup).
-
-- Reads config.yaml for training hyperparams, bands order, and S3 paths.
-- Uses K-fold role-rotation to achieve train/val/test ~ 0.8/0.1/0.1 (K auto by val frac).
-- Train-time augmentation; global percentile normalization from train fold.
-- Saves per-fold reports and an overall CV summary; uploads to S3 results/.
-"""
-
 import os
 import re
 import sys

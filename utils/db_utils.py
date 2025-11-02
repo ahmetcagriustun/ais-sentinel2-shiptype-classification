@@ -8,19 +8,7 @@ import boto3
 from datetime import datetime
 
 def create_pg_connection(db_config):
-    """
-    Establishes a PostgreSQL database connection using the provided configuration.
-
-    Args:
-        db_config (dict): A dictionary containing PostgreSQL connection parameters
-                          (host, port, dbname, user, password).
-
-    Returns:
-        connection: A psycopg2 connection object.
-
-    Raises:
-        psycopg2.OperationalError: If the connection fails.
-    """
+    
     try:
         conn = psycopg2.connect(
             host=db_config["host"],
@@ -34,47 +22,54 @@ def create_pg_connection(db_config):
         raise psycopg2.OperationalError(f"PostgreSQL connection failed: {e}")
 
 def create_table(conn, table_name, schema_sql):
-    """
-    Creates a table in PostgreSQL using the given schema.
-
-    Args:
-        conn: An open psycopg2 connection object.
-        table_name (str): Name of the table to be created.
-        schema_sql (str): SQL CREATE TABLE statement.
-
-    Returns:
-        None
-
-    Raises:
-        psycopg2.DatabaseError: If table creation fails.
-    """
     try:
         with conn.cursor() as cur:
-            cur.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = %s
+                );
+            """, (table_name,))
+            exists = cur.fetchone()[0]
+
+            if exists:
+                print(f"[WARN] Table '{table_name}' already exists. Skipping creation.")
+                return
+
             cur.execute(schema_sql)
-        conn.commit()
-        print(f"Table '{table_name}' created successfully.")
+            conn.commit()
+            print(f"Table '{table_name}' created successfully.")
     except Exception as e:
         conn.rollback()
-        print(f"Error creating table '{table_name}': {e}")
+        print(f"[ERROR] Failed to create table '{table_name}': {e}")
+        raise
+
+def ensure_table_exists(conn, table_name, schema_sql):
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = %s
+                );
+            """, (table_name,))
+            exists = cur.fetchone()[0]
+
+            if exists:
+                print(f"[WARN] Table '{table_name}' already exists. Skipping creation.")
+                return
+
+            cur.execute(schema_sql)  # Must contain full CREATE TABLE definition
+        conn.commit()
+        print(f"Table '{table_name}' created successfully (no drop).")
+    except Exception:
+        conn.rollback()
         raise
 
 def insert_dicts_to_table(conn, table_name, data):
-    """
-    Inserts data into the specified PostgreSQL table.
-    Accepts either a list of dictionaries (each dict = row) or a Pandas DataFrame.
 
-    Args:
-        conn: An open psycopg2 connection object.
-        table_name (str): Name of the table to insert data into.
-        data (list of dict or pandas.DataFrame): Data to be inserted.
-
-    Returns:
-        None
-
-    Raises:
-        psycopg2.DatabaseError: If the insertion fails.
-    """
     import pandas as pd
 
     # Convert DataFrame to list of dict if needed
@@ -106,12 +101,10 @@ def insert_dicts_to_table(conn, table_name, data):
 
 def get_product_names_from_postgres(
     config_path="config.yaml",
-    table_name="public.sentinel_metadata_select_deneme",
+    table_name="public.sentinel_metadata_select",
     column_name="api_id"
 ):
-    """
-    Reads product names from the specified PostgreSQL table and returns as a Python list.
-    """
+
     config = load_config(config_path)
     db = config["database"]
 
@@ -150,32 +143,25 @@ def get_date_list_from_db(db_config, table_name="ais_download_list", date_col="d
     return dates
 
 def _parse_ts(val: str):
-    """
-    Normalize AIS time strings to Python datetime for Postgres TIMESTAMP.
-    Accepts:
-      - '13/05/2024 00:00:00'  (DMY)
-      - '2024-05-13 00:00:00'  (ISO)
-      - '2024-05-13T00:00:00Z' (ISO Z)
-    Returns datetime or None.
-    """
+
     if val is None:
         return None
     s = str(val).strip()
     if not s:
         return None
-    # DMY format
+
     try:
         if '/' in s:
             return datetime.strptime(s, '%d/%m/%Y %H:%M:%S')
     except Exception:
         pass
-    # ISO with 'T' and optional 'Z'
+
     try:
         s2 = s.replace('T', ' ').replace('Z', '')
         return datetime.strptime(s2, '%Y-%m-%d %H:%M:%S')
     except Exception:
         pass
-    # Final fallback: try fromisoformat without 'Z'
+
     try:
         return datetime.fromisoformat(s.replace('Z', ''))
     except Exception:
@@ -197,16 +183,16 @@ def insert_ais_records_to_pg(conn, records, table_name="ship_raw_data"):
     values_template = ', '.join(['%s'] * len(keys))
     insert_sql = f'INSERT INTO {table_name} ({columns}) VALUES ({values_template})'
 
-    # Build sanitized rows:
+
     rows = []
     for rec in records:
         row = []
         for k in keys:
             v = rec.get(k, None)
-            # Normalize empty strings to None
+
             if isinstance(v, str) and v.strip() == '':
                 v = None
-            # Parse timestamps for the two columns that are TIMESTAMP in schema
+
             if k in ("# Timestamp", "ETA"):
                 v = _parse_ts(v)
             row.append(v)

@@ -31,20 +31,15 @@ from rasterio.windows import Window
 from pyproj import Transformer
 import gc  # for explicit garbage collection
 
-# Silence noisy urllib3 pool warnings (optional)
+
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
-# Single-threaded S3 transfers to reduce memory and pool pressure
 TRANSFER_CFG = TransferConfig(
-    max_concurrency=2,                  # ignored when use_threads=False, kept small anyway
+    max_concurrency=2,                  
     multipart_threshold=8 * 1024 * 1024,
     multipart_chunksize=8 * 1024 * 1024,
-    use_threads=False                   # <- force single-threaded transfer
+    use_threads=False                  
 )
-
-# --------------------------------------------------------------------------------------
-# Patch generator for Sentinel-2 + AIS (PostgreSQL driver) – headless/QGIS-free
-# --------------------------------------------------------------------------------------
 
 def _slug(text: str) -> str:
     """Create a safe, compact token from arbitrary text (e.g., 'Law enforcement')."""
@@ -53,10 +48,6 @@ def _slug(text: str) -> str:
     t = re.sub(r"\s+", "_", str(text).strip())
     t = re.sub(r"[^A-Za-z0-9_\-]", "", t)
     return t or "NA"
-
-# -------------------------
-# S3 helpers
-# -------------------------
 
 def make_s3_client(region: str | None = None, access_key_id: str | None = None, secret_access_key: str | None = None):
     """Create a conservative S3 client with low connection pool to reduce memory spikes."""
@@ -68,7 +59,7 @@ def make_s3_client(region: str | None = None, access_key_id: str | None = None, 
         kwargs["aws_secret_access_key"] = secret_access_key
     kwargs["config"] = Config(
         retries={'max_attempts': 5, 'mode': 'standard'},
-        max_pool_connections=4,           # keep small; we also disabled transfer threads
+        max_pool_connections=4,
         signature_version='s3v4'
     )
     return boto3.client("s3", **kwargs)
@@ -80,10 +71,6 @@ def s3_key_join(prefix: str, *parts: str) -> str:
     if prefix and suffix:
         return f"{prefix}/{suffix}"
     return prefix or suffix
-
-# -------------------------
-# DB helpers
-# -------------------------
 
 def open_pg(db):
     """Open a psycopg2 connection from a dict with {host, port, dbname, user, password}."""
@@ -125,10 +112,6 @@ def fetch_points_for_api(conn, table: str, api_id: str, limit: int | None = None
         rows = cur.fetchall()
     return [{k: v for k, v in zip(cols, r)} for r in rows]
 
-# -------------------------
-# Sentinel-2 SAFE zip helpers
-# -------------------------
-
 BAND_SUFFIX = {
     "B02": "_B02_10m.jp2",
     "B03": "_B03_10m.jp2",
@@ -169,10 +152,6 @@ def extract_members(zip_path: Path, members: dict[str, str], out_dir: Path) -> d
             paths[band] = dst
     return paths
 
-# -------------------------
-# Raster windowing helpers
-# -------------------------
-
 def lonlat_to_rowcol(src: rasterio.DatasetReader, lon: float, lat: float) -> tuple[int, int]:
     """Transform (lon,lat) WGS84 into (row,col) of the given raster."""
     if src.crs is None:
@@ -185,10 +164,6 @@ def lonlat_to_rowcol(src: rasterio.DatasetReader, lon: float, lat: float) -> tup
 def make_centered_window(row: int, col: int, size_px: int) -> Window:
     half = size_px // 2
     return Window(col - half, row - half, size_px, size_px)
-
-# -------------------------
-# Patch writing
-# -------------------------
 
 def write_multiband_geotiff(out_path: Path, ref_src: rasterio.DatasetReader, window: Window, arrays: list[np.ndarray],
                              dtype: str | None = None, meta_tags: dict | None = None):
@@ -221,10 +196,6 @@ def write_multiband_geotiff(out_path: Path, ref_src: rasterio.DatasetReader, win
         if meta_tags:
             dst.update_tags(**{k: str(v) for k, v in meta_tags.items()})
 
-# -------------------------
-# Main per-product runner
-# -------------------------
-
 def process_one_product(
     *,
     api_id: str,
@@ -248,7 +219,7 @@ def process_one_product(
     skipped = 0
 
     try:
-        # 1) Download SAFE.zip from S3 if not present (single-threaded transfer)
+
         if not local_zip.exists():
             logging.info("Downloading %s from s3://%s/%s", api_id, s3_bucket, safe_zip_key)
             try:
@@ -257,7 +228,7 @@ def process_one_product(
                 logging.error("Failed to download %s: %s", safe_zip_key, e)
                 return 0, 0
 
-        # 2) Discover band members in the zip and extract
+
         want = [b for b in bands if b != "TCI"] + (["TCI"] if save_tci else [])
         members = find_band_members_in_safe_zip(local_zip, want)
         if any(b not in members for b in [b for b in bands if b != "TCI"]):
@@ -266,7 +237,7 @@ def process_one_product(
 
         extracted = extract_members(local_zip, members, prod_dir)
 
-        # 3) Open reference + all 10m band datasets ONCE, reuse for all windows
+
         with ExitStack() as stack:
             ref = stack.enter_context(rasterio.open(extracted[bands[0]]))  # e.g., B02 as reference
             band_srcs = {b: stack.enter_context(rasterio.open(extracted[b])) for b in bands if b != "TCI"}
@@ -281,7 +252,7 @@ def process_one_product(
                 lon = float(rec["lon"])  # EPSG:4326
                 lat = float(rec["lat"])  # EPSG:4326
 
-                # Target S3 keys
+
                 base = f"{_slug(ship_type)}_{_slug(mmsi)}_{rec_id}"
                 mb_name = f"{base}.tif"      # multi-band B02,B03,B04,B08
                 tci_name = f"{base}_TCI.tif"
@@ -299,7 +270,7 @@ def process_one_product(
                     except Exception:
                         pass
 
-                # Compute window on reference grid
+
                 try:
                     row, col = lonlat_to_rowcol(ref, lon, lat)
                     win = make_centered_window(row, col, patch_size_px)
@@ -307,11 +278,11 @@ def process_one_product(
                     logging.warning("Indexing error for rec %s (lon=%s,lat=%s): %s", rec_id, lon, lat, e)
                     continue
 
-                # Read aligned windows from already-open band datasets
+
                 arrays = [band_srcs[b].read(1, window=win, boundless=True, fill_value=0)
                           for b in bands if b != "TCI"]
 
-                # Write multi-band GeoTIFF locally
+
                 local_mb = prod_dir / mb_name
                 meta_tags = {
                     "api_id": api_id,
@@ -326,10 +297,10 @@ def process_one_product(
                 write_multiband_geotiff(local_mb, ref, win, arrays, meta_tags=meta_tags)
                 del arrays  # free ASAP
 
-                # Upload multi-band (single-threaded)
+
                 s3_client.upload_file(str(local_mb), s3_bucket, out_key_mb, Config=TRANSFER_CFG)
 
-                # TCI (optional)
+
                 if tci_src is not None:
                     tci_arr = tci_src.read(window=win, boundless=True, fill_value=0)
                     local_tci = prod_dir / tci_name
@@ -344,7 +315,7 @@ def process_one_product(
                     except Exception:
                         pass
 
-                # Cleanup local mb file per record to save disk
+
                 try:
                     local_mb.unlink()
                 except Exception:
@@ -353,7 +324,7 @@ def process_one_product(
                 made += 1
 
     finally:
-        # 4) Cleanup extracted files and SAFE.zip (even on exceptions)
+
         try:
             shutil.rmtree(prod_dir, ignore_errors=True)
         except Exception:
@@ -367,9 +338,6 @@ def process_one_product(
     logging.info("%s \u2192 patches made=%d, skipped=%d", api_id, made, skipped)
     return made, skipped
 
-# -------------------------
-# CLI / Orchestration
-# -------------------------
 
 def load_yaml(path: str) -> dict:
     import yaml
@@ -397,12 +365,12 @@ def main():
 
     cfg = load_yaml(args.config)
 
-    # DB config
+
     db_cfg = cfg.get("database", {})
     if not db_cfg:
         raise SystemExit("Missing 'database' section in config.yaml")
 
-    # S3 config
+
     s3_cfg = cfg.get("s3", {})
     bucket = args.s3_bucket or s3_cfg.get("bucket")
     if not bucket:
@@ -416,12 +384,10 @@ def main():
     sk = s3_cfg.get("secret_access_key")
     s3 = make_s3_client(s3_region, ak, sk)
 
-    # Connect DB, get api_id list
     with open_pg(db_cfg) as conn:
         api_ids = fetch_api_ids(conn, args.table)
         logging.info("Found %d unique api_id(s) in %s", len(api_ids), args.table)
 
-        # Prepare work dir
         work_dir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="s2patch_"))
         work_dir.mkdir(parents=True, exist_ok=True)
         logging.info("Working dir: %s", work_dir)
@@ -450,7 +416,6 @@ def main():
             total_made += made
             total_skipped += skipped
 
-            # Strong cleanup between products
             del pts
             gc.collect()
 

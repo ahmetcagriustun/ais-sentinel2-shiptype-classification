@@ -1,55 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-clean_cloudy_s3.py
-==================
-
-Purpose
--------
-Identify and re-home cloud-contaminated Sentinel-2 training patches on Amazon S3
-under a dedicated prefix, to prevent their participation in model training and
-evaluation. This script favors quick heuristics on TCI (RGB) scenes when
-available, and falls back to a multi-band (B02,B03,B04,B08) proxy when the TCI
-is missing.
-
-Key Features
-------------
-- Scans S3: s3://{bucket}/{images_prefix}/{Class}/*.tif
-- Estimates cloud fraction from:
-  (a) TCI luminance threshold (fast; default), or
-  (b) Multi-band proxy using VIS & NIR intensity + NDVI upper bound (robust).
-- Moves (or copies) “cloudy” patches to: s3://{bucket}/{cloudy_prefix}/{Class}/...
-- Emits a CSV report and uploads it to s3://{bucket}/{results_prefix}/{run_id}/
-
-Why this matters
-----------------
-Cloud-laden training samples bias feature distributions and degrade the
-discriminative capacity of CNN classifiers for ship-type recognition. Automated
-screening allows reproducible curation across large datasets and facilitates
-transparent reporting in academic workflows.
-
-CLI Examples
-------------
-# Original usage (kept for backward compatibility):
-python clean_cloudy_s3.py --bright-thresh 0.85 --max-cloud-ratio 0.20
-
-# Safe trial (no changes):
-python clean_cloudy_s3.py --dry-run
-
-# Copy instead of move (source remains):
-python clean_cloudy_s3.py --copy-only
-
-# Target a custom destination prefix:
-python clean_cloudy_s3.py --out-prefix "processed/cloudy_v2/"
-
-# For main.py pass-through compatibility:
-python clean_cloudy_s3.py --config config.yaml --mode auto --include-tci --dry-run
-
-Notes
------
-- Thresholds fall back to config.yaml: `quality.*` if CLI not provided.
-- If you lack s3:DeleteObject permission, use `--copy-only` to avoid AccessDenied.
-"""
-
 import argparse
 import csv
 import io
@@ -65,7 +13,6 @@ import boto3
 import botocore
 import numpy as np
 
-# Optional readers
 try:
     import tifffile as tiff
     HAS_TIFF = True
@@ -78,10 +25,8 @@ try:
 except Exception:
     HAS_PIL = False
 
-# Project util
-from utils.config_utils import load_config
 
-# ---------- Filename helpers ----------
+from utils.config_utils import load_config
 
 TCI_RE = re.compile(r"_TCI\.tif$", flags=re.IGNORECASE)
 
@@ -145,28 +90,8 @@ def rehome_object(s3, bucket: str, src_key: str, dst_key: str, *, copy_only: boo
         print(f"[WARN] Delete failed for s3://{bucket}/{src_key}: {e}. "
               f"Copied to {dst_key}, source left in place.")
 
-# ---------- Cloud estimators ----------
-
 def estimate_cloud_ratio_from_tci(tci: np.ndarray, bright_thresh: float = 0.80) -> float:
-    """
-    Estimate cloud fraction from TCI luminance > threshold.
 
-    Rationale
-    ---------
-    Perceptual luminance (Y) proxies clouds as high-reflectance, near-white pixels.
-
-    Parameters
-    ----------
-    tci : np.ndarray
-        H×W×3 uint16/uint8 array.
-    bright_thresh : float
-        Luminance threshold (0..1) after normalization by dtype max.
-
-    Returns
-    -------
-    float
-        Fraction of pixels labeled 'cloudy'.
-    """
     tci = tci.astype(np.float32)
     if tci.max() > 1.0:
         # Normalize dynamically by metadata-implied range
@@ -181,22 +106,7 @@ def estimate_cloud_ratio_from_multiband(mb: np.ndarray,
                                         vis_thresh: float = 0.75,
                                         nir_thresh: float = 0.65,
                                         ndvi_upper: float = 0.25) -> float:
-    """
-    Multi-band proxy for clouds: bright in VIS & NIR, with low vegetation index.
 
-    Heuristic
-    ---------
-    - VIS brightness: mean(B02,B03,B04)
-    - NIR brightness: B08
-    - NDVI upper bound: (B08 - B04) / (B08 + B04)
-
-    Parameters are tuned for over-flagging avoidance on maritime scenes.
-
-    Returns
-    -------
-    float
-        Fraction of pixels passing the cloud mask.
-    """
     C = mb.shape[2]
     if C < 4:  # fallback: only VIS brightness if NIR missing
         vis = mb.mean(axis=2)
@@ -209,10 +119,7 @@ def estimate_cloud_ratio_from_multiband(mb: np.ndarray,
     cloud_mask = (vis > vis_thresh) & (nir > nir_thresh) & (ndvi < ndvi_upper)
     return float(cloud_mask.mean())
 
-# ---------- Readers ----------
-
 def open_tci_from_s3(s3, bucket: str, key: str) -> Optional[np.ndarray]:
-    """Return H×W×3 array from TCI GeoTIFF (uint16) if tifffile/PIL is available."""
     raw = read_s3_object_bytes(s3, bucket, key)
     if HAS_TIFF:
         with tiff.TiffFile(io.BytesIO(raw)) as tf:
@@ -226,7 +133,6 @@ def open_tci_from_s3(s3, bucket: str, key: str) -> Optional[np.ndarray]:
     raise RuntimeError("No reader available for TCI (install tifffile or Pillow).")
 
 def open_multiband_from_s3(s3, bucket: str, key: str) -> np.ndarray:
-    """Return H×W×C array from multi-band GeoTIFF using tifffile (required)."""
     if not HAS_TIFF:
         raise RuntimeError("tifffile is required for multi-band GeoTIFF reading.")
     raw = read_s3_object_bytes(s3, bucket, key)
@@ -240,8 +146,6 @@ def open_multiband_from_s3(s3, bucket: str, key: str) -> np.ndarray:
         if arr.max() > 1.0:
             arr /= 65535.0
         return arr
-
-# ---------- Main ----------
 
 def main():
     ap = argparse.ArgumentParser(
@@ -354,11 +258,9 @@ def main():
     csv_path = out_dir / f"cloud_clean_report_{run_id}.csv"
     rows = []
 
-    # Iterate over merged basenames (authoritative set)
     for base_key, merged_key in merged.items():
         total += 1
 
-        # Resolve decision source
         has_tci = base_key in tci
         use_tci = (args.mode in ("auto", "tci-only")) and has_tci
         if args.mode == "tci-only" and not has_tci:
@@ -367,7 +269,6 @@ def main():
         if args.mode == "merged-only":
             use_tci = False
 
-        # Read imagery & estimate cloud ratio
         try:
             if use_tci:
                 arr = open_tci_from_s3(s3, bucket, tci[base_key])
@@ -387,19 +288,15 @@ def main():
             examined += 1
             continue
 
-        # Mark as cloudy → plan re-home
         examined += 1
         cloudy += 1
 
-        # Compute destinations
-        # Preserve class subfolder (if any), e.g. <Class>/file.tif → cloudy_prefix/<Class>/file.tif
         dst_merged = merged_key.replace(images_prefix, cloudy_prefix, 1) if merged_key.startswith(images_prefix) else f"{cloudy_prefix}{merged_key}"
         dst_tci = None
         if has_tci and (use_tci or args.include_tci):
             tci_key = tci[base_key]
             dst_tci = tci_key.replace(images_prefix, cloudy_prefix, 1) if tci_key.startswith(images_prefix) else f"{cloudy_prefix}{tci_key}"
 
-        # Apply (or simulate) actions
         action = "MOVE"
         if args.copy_only:
             action = "COPY-ONLY"
@@ -408,9 +305,7 @@ def main():
 
         if not args.dry_run:
             try:
-                # merged file
                 rehome_object(s3, bucket, merged_key, dst_merged, copy_only=args.copy_only, delete=args.delete)
-                # paired TCI file (optional)
                 if dst_tci:
                     rehome_object(s3, bucket, tci_key, dst_tci, copy_only=args.copy_only, delete=args.delete)
             except botocore.exceptions.ClientError as e:
@@ -431,7 +326,6 @@ def main():
         if examined % 500 == 0:
             print(f" .. examined={examined} cloudy={cloudy} ({cloudy/max(1,examined):.1%})")
 
-    # Write CSV and upload to S3 results/
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["class", "merged_key", "tci_key", "mode", "cloud_ratio", "action", "dst_merged", "dst_tci"])

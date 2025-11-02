@@ -8,6 +8,5 @@ WHERE sensing_time IS NOT NULL
 GROUP BY DATE(sensing_time)
 ORDER BY date;
 
--- İstersen sıkılaştır:
 ALTER TABLE public.ais_download_list
     ALTER COLUMN date SET NOT NULL;

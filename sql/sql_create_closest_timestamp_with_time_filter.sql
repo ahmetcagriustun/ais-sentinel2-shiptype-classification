@@ -15,7 +15,7 @@ WITH closest_timestamps AS (
         sentinel_download_index_geom sdi
       ON sr."# Timestamp" BETWEEN sdi.sensing_time_without_tz - INTERVAL '10 minutes'
                               AND sdi.sensing_time_without_tz + INTERVAL '10 minutes'
-     AND ST_Intersects(sr.geom, ST_Transform(sdi.geom, 4326))
+     AND ST_Intersects(sr.geom, sdi.geom_4326)
 )
 , ranked_timestamps AS (
     SELECT 
