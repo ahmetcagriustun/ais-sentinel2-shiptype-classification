@@ -355,7 +355,7 @@ def main():
     p.add_argument("--workdir", default=None, help="Working directory (default: system temp)")
     p.add_argument("--s3-bucket", default=None, help="Override S3 bucket (else from config)")
     p.add_argument("--s3-sentinel-prefix", default=None, help="Override S3 prefix for SAFE zips (else from config.s3.sentinel2_prefix)")
-    p.add_argument("--s3-out-prefix", default=None, help="Override S3 output prefix (else from config.s3.training_patches_prefix or 'training-patches/')")
+    p.add_argument("--s3-out-prefix", default=None, help="Override S3 output prefix (else from config.s3.training_dataset_prefix or 'training-patches/')")
     p.add_argument("--no-skip-existing", action="store_true", help="Do not skip if outputs already exist on S3")
     p.add_argument("--log-level", default="INFO", help="Logging level")
 
@@ -377,7 +377,7 @@ def main():
         raise SystemExit("Missing S3 bucket (either --s3-bucket or config.s3.bucket)")
 
     s2_prefix = args.s3_sentinel_prefix or s3_cfg.get("sentinel2_prefix", "sentinel2/")
-    out_prefix = args.s3_out_prefix or s3_cfg.get("training_patches_prefix", "training-patches-all/")
+    out_prefix = args.s3_out_prefix or s3_cfg.get("training_dataset_prefix", "training-patches/")
 
     s3_region = s3_cfg.get("region")
     ak = s3_cfg.get("access_key_id")

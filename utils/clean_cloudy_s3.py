@@ -193,8 +193,8 @@ def main():
 
     # Resolve prefixes
     bucket = s3_cfg["bucket"]
-    # Accept both 'images_prefix' (ship-type bucketed) or 'training_patches_prefix' (flat)
-    images_prefix = s3_cfg.get("images_prefix") or s3_cfg.get("training_patches_prefix") or "training-patches/"
+    # Accept both 'images_prefix' (ship-type bucketed) or 'training_dataset_prefix' (flat)
+    images_prefix = s3_cfg.get("images_prefix") or s3_cfg.get("training_dataset_prefix") or "training-patches/"
     images_prefix = ensure_prefix(images_prefix)
     results_prefix = ensure_prefix(s3_cfg.get("results_prefix", "results/"))
 

@@ -35,14 +35,11 @@ s3:                            # used by: main.py steps, utils.*, cleaner, train
   secret_access_key: ""
 
   # Sources
-  raw_data_prefix: "raw-data/"                    # AIS ZIPs (ais.download / ais.parse-s3)
+  raw_data_prefix: "AIS/"                    # AIS ZIPs (ais.download / ais.parse-s3)
   sentinel2_prefix: "sentinel2/"                  # SAFE .zip (s2.download-names / s2.index-zip-metadata)
 
   # Patches
-  patches_prefix: "training-patches/"    # used by: patches_sentinel2_from_db.py, cleaner
-  training_dataset_prefix: "training-patches/"  
-  rebucketed_prefix: "training-patches-ship-type"       # used by: rebucket_by_ship_type.py (source)
-  cv_dataset_prefix: "training-patches-ship-type/"  # used by: train_cnn3-3_resnet34.py
+  training_dataset_prefix: "training-patches/"
 
   # Re-bucket (destination)
   dest_training_by_type_prefix: "training-patches-ship-type/"         # used by: rebucket_by_ship_type.py

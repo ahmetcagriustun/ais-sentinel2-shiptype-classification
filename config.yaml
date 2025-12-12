@@ -15,7 +15,7 @@ project:
   region_bbox: [2.76, 53.02, 19.29, 59.79]
 
 database:                      # used by: main.py (AIS parse, patches), utils.db_utils, patches_sentinel2_from_db.py
-  host: "ais-sentinel2-2.c70wuo2yyclg.eu-central-1.rds.amazonaws.com"
+  host: "ais-sentinel2.c70wuo2yyclg.eu-central-1.rds.amazonaws.com"
   port: 5432
   dbname: "postgres"
   user: "acustun"
@@ -38,19 +38,16 @@ s3:                            # used by: main.py steps, utils.*, cleaner, train
   sentinel2_prefix: "sentinel2/"                  # SAFE .zip (s2.download-names / s2.index-zip-metadata)
 
   # Patches
-  patches_prefix: "training-patches/"    # used by: patches_sentinel2_from_db.py, cleaner
-  training_dataset_prefix: "training-patches/"  
-  rebucketed_prefix: "training-patches-ship-type"       # used by: rebucket_by_ship_type.py (source)
-  cv_dataset_prefix: "training-patches-ship-type/"  # used by: train_cnn3-3_resnet34.py
+  training_dataset_prefix: "training-patches-all/"
 
   # Re-bucket (destination)
-  dest_training_by_type_prefix: "training-patches-ship-type/"         # used by: rebucket_by_ship_type.py
+  dest_training_by_type_prefix: "training-patches-ship-type2/"         # used by: rebucket_by_ship_type.py
 
   # Results & reports
-  results_prefix: "results/"                     # training outputs, cleaner CSV report
+  results_prefix: "result2s/"                     # training outputs, cleaner CSV report
   # Cleaner optional aliases
   images_prefix: ""                              # leave empty to default to training_patches_prefix
-  cloudy_out_prefix: "cloudy_images/"
+  cloudy_out_prefix: "cloudy_images2/"
 
 # Training hyperparameters — used by: train_cnn3-3_resnet34.py
 training:

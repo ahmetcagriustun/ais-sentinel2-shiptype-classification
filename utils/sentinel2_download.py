@@ -115,7 +115,6 @@ def download_and_upload_products_by_name(
 
     for idx, prod_name in enumerate(product_name_list, 1):
         zip_filename = f"{prod_name}.zip"
-        # S3'te dosya var mı kontrol et
         if s3_file_exists(bucket, s3_prefix, zip_filename, s3_kwargs):
             print(f"{zip_filename} already exists in S3. Skipping download.")
             continue

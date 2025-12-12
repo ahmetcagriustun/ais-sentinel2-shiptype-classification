@@ -14,10 +14,26 @@ Commands
 - db.exec-sql                    : execute a single SQL file on the configured database
                                     python main.py db.exec-sql --sql-file sql/sql_create_point_geom.sql
                                     python main.py db.exec-sql --sql-file sql/sql_create_sensing_time_without_tz.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_index.sql
+                                    python main.py db.exec-sql --sql-file sql/sql_create_index_sentinel.sql
+                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais1.sql
+                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais2.sql
+                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais3.sql                                  
                                     python main.py db.exec-sql --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
                                     python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_table.sql
                                     python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_open_sea.sql
+
+python main.py ais.parse-s3 \
+  --table ship_raw_data \
+  --start-date 2024-01-01 \
+  --end-date 2025-01-01
+
+python main.py ais.parse-s3 \
+  --table ship_raw_data \
+  --key-contains "aisdk-2023-12"
+
+- db.build-closest              : build closest_mmsi_timestamps from ship_raw_data and sentinel_download_index_geom
+                                    python main.py db.build-closest --time-window-minutes 10
+
                                     
 - db.exec-sql-batch             : execute all SQL files in a folder (optionally filtered), in order
 - patches.build                  : build Sentinel-2 patches by delegating to utils.patches_sentinel2_from_db
@@ -41,13 +57,30 @@ Commands
                       --map-file config/ship_type_map.yaml \
                       --dry-run
 """
-
 import os
 import glob
 import sys
 import subprocess
 import argparse
+import logging
 
+
+level = os.getenv("LOG_LEVEL", "INFO").upper()
+fmt = os.getenv("LOG_FMT", "[%(levelname)s] %(name)s: %(message)s")
+datefmt = os.getenv("LOG_DATEFMT", "%Y-%m-%d %H:%M:%S")
+
+logging.basicConfig(
+    level=getattr(logging, level, logging.INFO),
+    format=fmt,
+    datefmt=datefmt,
+)
+
+log_file = os.getenv("LOG_FILE")
+if log_file:
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.getLogger().level)
+    fh.setFormatter(logging.Formatter(fmt, datefmt))
+    logging.getLogger().addHandler(fh)
 
 from utils.config_utils import load_config
 from utils.db_utils import (
@@ -64,7 +97,8 @@ from utils.sentinel2_download import (
 )
 from utils.ais_download import download_ais_zips_from_dates
 from utils.s3_utils import list_s3_zip_files
-from utils.ais_parser import process_zip_s3_to_pg_disk
+from utils.ais_parser import process_zip_s3_to_pg_disk,filter_ais_zip_keys
+from utils.closest_mmsi_timestamps_utils import batch_insert_closest_mmsi_timestamps
 
 def cmd_s2_select_file(args):
     sql_file = args.sql_file
@@ -178,7 +212,7 @@ def cmd_ais_download(args):
     # S3 config
     s3_conf = cfg["s3"]
     s3_bucket = s3_conf["bucket"]
-    ais_prefix = args.prefix or s3_conf.get("ais_prefix", "AIS/")
+    ais_prefix = args.prefix or s3_conf.get("raw_data_prefix", "AIS/")
     s3_kwargs = {}
     if s3_conf.get("region"):
         s3_kwargs["region_name"] = s3_conf["region"]
@@ -219,9 +253,21 @@ def cmd_ais_parse_s3(args):
     try:
         all_zips = list_s3_zip_files(s3_bucket, ais_prefix, s3_kwargs)
         print(f"[ais.parse-s3] Found {len(all_zips)} ZIP files under s3://{s3_bucket}/{ais_prefix}")
-        for s3_key in all_zips:
+
+        filtered = filter_ais_zip_keys(
+            all_zips,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            key_contains=args.key_contains,
+        )
+
+        filtered = sorted(filtered)
+        print(f"[ais.parse-s3] After filters: {len(filtered)} ZIP files to process.")
+
+        for s3_key in filtered:
             print(f"[ais.parse-s3] Processing: s3://{s3_bucket}/{s3_key}")
             process_zip_s3_to_pg_disk(s3_bucket, s3_key, conn, table_name, s3_kwargs)
+
         print("[ais.parse-s3] All AIS records inserted!")
     finally:
         conn.close()
@@ -327,29 +373,27 @@ def cmd_patches_clean_cloudy(args):
 
 def cmd_patches_rebucket(args):
     base_cmd = [sys.executable, "-m", "utils.rebucket_by_ship_type"]
-    fallback_cmd = [sys.executable, "-m", "utils.rebucked_by_ship_type"]  # in case repo uses old name
-
-    # Forward --config if script supports it (zararsızsa da sorun olmaz)
-    forwarded = base_cmd + ["--config", args.config] if args.config else base_cmd
+    if args.config:
+        base_cmd += ["--config", args.config]
     if args.extra:
-        forwarded += args.extra
+        base_cmd += args.extra
 
-    print("[patches.rebucket] Trying:", " ".join(forwarded))
-    try:
-        subprocess.run(forwarded, check=True)
-        print("[patches.rebucket] DONE.")
-        return
-    except subprocess.CalledProcessError as e:
-        print(f"[patches.rebucket] Module name 'utils.rebucket_by_ship_type' failed (exit {e.returncode}). Trying fallback...")
+    logging.getLogger(__name__).info("[patches.rebucket] Running: %s", " ".join(base_cmd))
+    subprocess.run(base_cmd, check=True)
+    logging.getLogger(__name__).info("[patches.rebucket] DONE.")
 
-    # Fallback to old module name
-    forwarded_fb = fallback_cmd + (["--config", args.config] if args.config else [])
-    if args.extra:
-        forwarded_fb += args.extra
+def cmd_db_build_closest(args):
 
-    print("[patches.rebucket] Fallback running:", " ".join(forwarded_fb))
-    subprocess.run(forwarded_fb, check=True)
-    print("[patches.rebucket] DONE (fallback).")
+    cfg = load_config(args.config)
+    db_conf = cfg["database"]
+
+    batch_insert_closest_mmsi_timestamps(
+        db_conf=db_conf,
+        verbose=not args.quiet,
+        create_table_if_not_exists=not args.no_create,
+        truncate_existing=args.truncate,
+        time_window_minutes=args.time_window_minutes,
+    )
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -412,18 +456,71 @@ def build_parser():
     ad.add_argument("--date-col", default="date",
                     help="Date column name in --table.")
     ad.add_argument("--prefix", default=None,
-                    help="Override S3 AIS prefix; default from config.s3.ais_prefix or 'AIS/'.")
+                    help="Override S3 AIS prefix; default from config.s3.raw_data_prefix or 'AIS/'.")
     ad.set_defaults(func=cmd_ais_download)
 
     # ais.parse-s3
-    ap = sub.add_parser("ais.parse-s3",
-                        help="Parse AIS ZIPs from S3 raw_data_prefix and insert into Postgres using fast COPY.",
-                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--table", default="ship_raw_data",
-                    help="Target Postgres table to insert AIS rows.")
-    ap.add_argument("--prefix", default=None,
-                    help="Override S3 prefix; default from config.s3.raw_data_prefix or 'raw-data/'.")
+    ap = sub.add_parser(
+        "ais.parse-s3",
+        help="Parse AIS ZIPs from S3 and insert into Postgres using fast COPY.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument(
+        "--table",
+        default="ship_raw_data",
+        help="Target Postgres table to insert AIS rows.",
+    )
+    ap.add_argument(
+        "--prefix",
+        default=None,
+        help="Override S3 prefix; default from config.s3.raw_data_prefix or 'AIS/'.",
+    )
+    ap.add_argument(
+        "--start-date",
+        default=None,
+        help="Optional start date (YYYY-MM-DD). ZIPs outside [start-date, end-date) are skipped.",
+    )
+    ap.add_argument(
+        "--end-date",
+        default=None,
+        help="Optional end date (YYYY-MM-DD, exclusive). For 'through 2023-12-31' use 2024-01-01.",
+    )
+    ap.add_argument(
+        "--key-contains",
+        default=None,
+        help="Optional substring that S3 key basename must contain (e.g. 'aisdk-2023-12').",
+    )
     ap.set_defaults(func=cmd_ais_parse_s3)
+
+
+    # db.build-closest
+    bc = sub.add_parser(
+        "db.build-closest",
+        help="Build closest_mmsi_timestamps from ship_raw_data and sentinel_download_index_geom.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    bc.add_argument(
+        "--time-window-minutes",
+        type=int,
+        default=10,
+        help="Half-width of time window around sensing_time_without_tz.",
+    )
+    bc.add_argument(
+        "--no-create",
+        action="store_true",
+        help="Skip CREATE TABLE step; assume closest_mmsi_timestamps already exists.",
+    )
+    bc.add_argument(
+        "--truncate",
+        action="store_true",
+        help="TRUNCATE closest_mmsi_timestamps before inserting (rebuild from scratch).",
+    )
+    bc.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce console logging.",
+    )
+    bc.set_defaults(func=cmd_db_build_closest)
 
     # db.exec-sql (single file)
     es = sub.add_parser("db.exec-sql",
