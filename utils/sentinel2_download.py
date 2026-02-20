@@ -189,10 +189,7 @@ def process_zip_files_in_s3_streaming(s3_bucket, s3_prefix, s3_kwargs, conn, tab
     print(f"Inserted {inserted_count} records to DB.")
 
 def ensure_sentinel_download_index_table(conn, table_name: str = "public.sentinel_download_index"):
-    """
-    Create the 'sentinel_download_index' table if it does not exist.
-    The table stores product file names and (optionally) parsed sensing_time.
-    """
+
     ddl = f"""
     CREATE TABLE IF NOT EXISTS {table_name} (
         file_name     TEXT PRIMARY KEY,

@@ -47,11 +47,6 @@ def filter_zip_keys_by_date(
     start_date: Optional[date],
     end_date: Optional[date],
 ) -> List[str]:
-    """
-    Keep AIS ZIP keys whose date range intersects [start_date, end_date).
-
-    end_date is exclusive (same logic as '# Timestamp' < end_date).
-    """
     if not start_date and not end_date:
         return list(keys)
 
@@ -80,11 +75,7 @@ def filter_ais_zip_keys(
     end_date: Optional[str] = None,
     key_contains: Optional[str] = None,
 ) -> List[str]:
-    """
-    Convenience wrapper used by the CLI:
-    - start_date / end_date are YYYY-MM-DD strings (end_date is exclusive),
-    - key_contains filters by substring on the basename.
-    """
+
     import os
 
     keys_list = list(keys)

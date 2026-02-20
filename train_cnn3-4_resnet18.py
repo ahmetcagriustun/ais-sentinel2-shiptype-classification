@@ -1,14 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Train CNN with stratified (no-group) cross-validation on multiband Sentinel-2 patches.
-Leisure merge: Sailing + Pleasure -> Leisure (5-class setup).
-
-- Reads config.yaml for training hyperparams, bands order, and S3 paths.
-- Uses K-fold role-rotation to achieve train/val/test ~ 0.8/0.1/0.1 (K auto by val frac).
-- Train-time augmentation; global percentile normalization from train fold.
-- Saves per-fold reports and an overall CV summary; uploads to S3 results/.
-"""
-
 import os
 import re
 import sys
@@ -88,11 +77,11 @@ def load_config(path="config.yaml") -> dict:
     s3cfg = cfg.get("s3", {})
     bucket = s3cfg.get("bucket")
     if not bucket:
-        print("ERROR: config.yaml not found.", file=sys.stderr)
+        print("s3.bucket is required.", file=sys.stderr)
         sys.exit(1)
 
     results_prefix = s3cfg.get("results_prefix", "results/")
-    cv_dataset_prefix = s3cfg.get("cv_dataset_prefix", "training-patches-ship-type/")
+    cv_dataset_prefix = s3cfg.get("cv_dataset_prefix", "training-patches-ship-type-opensea/")
 
     def norm(p): return p if p.endswith("/") else p + "/"
 
@@ -152,28 +141,42 @@ def s3_upload_dir(bucket: str, local_dir: str, dest_prefix: str):
 # Labels (MERGED)
 # ---------------------------
 
-# Final 5-class list with merge
-CLASSES = ["Cargo", "Fishing", "Passenger", "Leisure", "Tanker"]
+# Final 4-class list with merges:
+# - Sailing + Pleasure -> Leisure
+# - Cargo + Tanker     -> CargoTanker
+CLASSES = ["CargoTanker", "Fishing", "Passenger", "Leisure"]
 
-# Any of these folder tokens map to Leisure
+# Folder tokens that map to merged classes
 LEISURE_ALIASES = {"Sailing", "Pleasure", "Leisure"}
+CARGOTANKER_ALIASES = {"Cargo", "Tanker", "CargoTanker"}
 
 def parse_label_from_path(p: str) -> str:
     """
-    Parse label from path segments. If any segment equals Sailing or Pleasure,
-    map it to Leisure. Backward-compatible with existing directory names.
+    Parse label from path segments.
+
+    Merges (backward-compatible with existing directory names):
+    - Sailing / Pleasure  -> Leisure
+    - Cargo / Tanker      -> CargoTanker
     """
     parts = set(p.replace("\\", "/").split("/"))
-    # direct hits first
+    # direct hits first (merged aliases)
     if LEISURE_ALIASES & parts:
         return "Leisure"
-    # otherwise check remaining classes
+    if CARGOTANKER_ALIASES & parts:
+        return "CargoTanker"
+
+    # otherwise check remaining classes (already merged)
     for c in CLASSES:
         if c in parts:
             return c
-    # fallback: parent directory name -> apply Leisure mapping if needed
+
+    # fallback: parent directory name -> apply merge mapping if needed
     parent = p.replace("\\", "/").split("/")[-2]
-    return "Leisure" if parent in LEISURE_ALIASES else parent
+    if parent in LEISURE_ALIASES:
+        return "Leisure"
+    if parent in CARGOTANKER_ALIASES:
+        return "CargoTanker"
+    return parent
 
 # ---------------------------
 # I/O helpers
@@ -279,7 +282,7 @@ class S2Dataset(Dataset):
         return x, y
 
 # ---------------------------
-# Model: ResNet-34-ish
+# Model: ResNet-18-ish
 # ---------------------------
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -305,8 +308,8 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
         return out
 
-class SmallResNet34(nn.Module):
-    """ResNet-34-ish backbone adapted to N-channel input (blocks per stage: 3,4,6,3)."""
+class SmallResNet18(nn.Module):
+    """ResNet-18-ish backbone adapted to N-channel input."""
     def __init__(self, in_ch=4, num_classes=5):
         super().__init__()
         self.inplanes = 64
@@ -314,14 +317,12 @@ class SmallResNet34(nn.Module):
         self.bn1   = nn.BatchNorm2d(64)
         self.relu  = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        # ResNet-34 uses BasicBlock with [3, 4, 6, 3] blocks
-        self.layer1 = self._make_layer(64,  3, stride=1)
-        self.layer2 = self._make_layer(128, 4, stride=2)
-        self.layer3 = self._make_layer(256, 6, stride=2)
-        self.layer4 = self._make_layer(512, 3, stride=2)
+        self.layer1 = self._make_layer(64,  2, stride=1)
+        self.layer2 = self._make_layer(128, 2, stride=2)
+        self.layer3 = self._make_layer(256, 2, stride=2)
+        self.layer4 = self._make_layer(512, 2, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.fc = nn.Linear(512*BasicBlock.expansion, num_classes)
-
     def _make_layer(self, planes, blocks, stride):
         downsample = None
         if stride != 1 or self.inplanes != planes * BasicBlock.expansion:
@@ -334,7 +335,6 @@ class SmallResNet34(nn.Module):
         for _ in range(1, blocks):
             layers.append(BasicBlock(self.inplanes, planes))
         return nn.Sequential(*layers)
-
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
@@ -343,7 +343,6 @@ class SmallResNet34(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
-
 
 # ---------------------------
 # Metrics / Reporting
@@ -556,17 +555,32 @@ def main():
     out_root = os.path.join("results", f"cv_{ts}")
     os.makedirs(out_root, exist_ok=True)
 
-    # 1) Download dataset from S3 to local cache
+    # 1) Download dataset from S3 to local cache (skip if already cached)
     bucket = s3cfg["bucket"]; src_prefix = s3cfg["cv_dataset_prefix"]
     print(f"Listing S3: s3://{bucket}/{src_prefix}")
     keys = s3_list_keys(bucket, src_prefix)
     if not keys:
         raise RuntimeError("No .tif files found under cv_dataset_prefix.")
-    local_cache = "data_cache_cv"
-    print(f"Downloading {len(keys)} files to ./{local_cache} ...")
-    s3_download_to_tree(bucket, keys, src_prefix, local_cache)
 
-    # 2) Build manifest (path, label) with Leisure mapping
+    # NOTE: If you already downloaded the dataset before, this block will only
+    #       download missing files instead of re-downloading everything.
+    local_cache = "dataset"
+    os.makedirs(local_cache, exist_ok=True)
+
+    missing_keys = []
+    for k in keys:
+        rel = k[len(src_prefix):]
+        local_path = os.path.join(local_cache, rel)
+        if not os.path.exists(local_path):
+            missing_keys.append(k)
+
+    if missing_keys:
+        print(f"Downloading {len(missing_keys)}/{len(keys)} missing files to ./{local_cache} ...")
+        s3_download_to_tree(bucket, missing_keys, src_prefix, local_cache)
+    else:
+        print(f"Local cache is complete ({len(keys)} files). Skipping download.")
+
+    # 2) Build manifest (path, label) with merged labels (Leisure, CargoTanker)
     files = glob.glob(os.path.join(local_cache, "**", "*.tif"), recursive=True) + \
             glob.glob(os.path.join(local_cache, "**", "*.tiff"), recursive=True)
     samples_all = []
@@ -574,7 +588,7 @@ def main():
         fname = os.path.basename(p).lower()
         if "tci" in fname: continue
         label_name = parse_label_from_path(p)
-        # Map any unknown Sailing/Pleasure tokens to Leisure handled in parser
+        # Merged class mapping is handled in parse_label_from_path()
         if label_name not in CLASSES:
             # Unknown directory – skip silently to be safe
             continue
@@ -591,7 +605,7 @@ def main():
     if len(bands_order) != in_ch:
         warnings.warn(f"bands_order length ({len(bands_order)}) != image channels ({in_ch}). "
                       f"Proceeding with {in_ch} channels (will use first {in_ch}).")
-    num_classes = len(CLASSES)  # 5
+    num_classes = len(CLASSES)  # 4
 
     # 3) Stratified K-Fold (NO GROUPS)
     train_frac, val_frac, test_frac = tr["train_val_test_split"]
@@ -648,7 +662,7 @@ def main():
             expected_channels=in_ch, device=device
         )
 
-        model = SmallResNet34(in_ch=in_ch, num_classes=num_classes).to(device)
+        model = SmallResNet18(in_ch=in_ch, num_classes=num_classes).to(device)
         fold_dir = os.path.join(out_root, f"fold_{r:02d}")
         os.makedirs(fold_dir, exist_ok=True)
 
@@ -664,7 +678,7 @@ def main():
         print(f"[Fold {r}] Train wall-time = {format_hms(fold_elapsed)} ({fold_elapsed:.1f}s)")
 
         if out["best_state"] is not None:
-            torch.save(out["best_state"], os.path.join(fold_dir, "best_model_resnet34.pth"))
+            torch.save(out["best_state"], os.path.join(fold_dir, "best_model.pth"))
 
         y_true = np.array(out["y_true_test"]); y_pred = np.array(out["y_pred_test"])
         acc = accuracy_score(y_true, y_pred)

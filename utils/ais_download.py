@@ -32,9 +32,7 @@ def get_ais_url_and_zipname(date_str: str, base_url: str):
 
 
 def download_url_to_s3_if_needed(url, s3_bucket, s3_prefix, s3_filename, s3_kwargs):
-    """
-    Download a file from URL and upload it to S3 if not already present.
-    """
+
     if s3_file_exists(s3_bucket, s3_prefix, s3_filename, s3_kwargs):
         print(f"{s3_prefix}{s3_filename} already exists in S3, skipping.")
         return
@@ -59,10 +57,7 @@ def download_ais_zips_from_dates(
     date_col="date",
     config_path="config.yaml"
 ):
-    """
-    Read date list from Postgres and download AIS ZIPs to S3.
-    Base URL is read from config.yaml under: ais.base_url
-    """
+
     cfg = load_config(config_path)
     base_url = cfg.get("ais", {}).get("base_url", "https://aisdata.ais.dk")
     print(f"[ais.download] Using AIS base URL: {base_url}")

@@ -1,14 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Train CNN with stratified (no-group) cross-validation on multiband Sentinel-2 patches.
-Leisure merge: Sailing + Pleasure -> Leisure (5-class setup).
-
-- Reads config.yaml for training hyperparams, bands order, and S3 paths.
-- Uses K-fold role-rotation to achieve train/val/test ~ 0.8/0.1/0.1 (K auto by val frac).
-- Train-time augmentation; global percentile normalization from train fold.
-- Saves per-fold reports and an overall CV summary; uploads to S3 results/.
-"""
-
 import os
 import re
 import sys
@@ -64,7 +53,7 @@ def format_hms(seconds: float) -> str:
 
 def load_config(path="config.yaml") -> dict:
     if not os.path.exists(path):
-        print("HATA: config.yaml bulunamadı.", file=sys.stderr)
+        print("ERROR: config.yaml not found.", file=sys.stderr)
         sys.exit(1)
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -88,11 +77,11 @@ def load_config(path="config.yaml") -> dict:
     s3cfg = cfg.get("s3", {})
     bucket = s3cfg.get("bucket")
     if not bucket:
-        print("HATA: config.yaml -> s3.bucket zorunlu", file=sys.stderr)
+        print("s3.bucket is required.", file=sys.stderr)
         sys.exit(1)
 
     results_prefix = s3cfg.get("results_prefix", "results/")
-    cv_dataset_prefix = s3cfg.get("cv_dataset_prefix", "training-patches-ship-type/")
+    cv_dataset_prefix = s3cfg.get("cv_dataset_prefix", "training-patches-ship-type-opensea/")
 
     def norm(p): return p if p.endswith("/") else p + "/"
 
@@ -131,29 +120,13 @@ def s3_list_keys(bucket: str, prefix: str) -> List[str]:
     return keys
 
 def s3_download_to_tree(bucket: str, keys: List[str], src_prefix: str, dst_root: str):
-    """
-    Download S3 objects under `src_prefix` into `dst_root`, preserving folder tree.
-    If a file already exists locally, skip downloading to save time and bandwidth.
-    """
     os.makedirs(dst_root, exist_ok=True)
     cli = s3_client()
-    skipped, downloaded = 0, 0
-
     for k in keys:
-        rel = k[len(src_prefix):]  # keep subfolder structure relative to src_prefix
+        rel = k[len(src_prefix):]
         local_path = os.path.join(dst_root, rel)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-        # ✅ Skip if the file already exists locally
-        if os.path.exists(local_path):
-            skipped += 1
-            continue
-
         cli.download_file(bucket, k, local_path)
-        downloaded += 1
-
-    print(f"[s3_download_to_tree] downloaded={downloaded}, skipped_existing={skipped}")
-
 
 def s3_upload_dir(bucket: str, local_dir: str, dest_prefix: str):
     cli = s3_client()
@@ -164,36 +137,26 @@ def s3_upload_dir(bucket: str, local_dir: str, dest_prefix: str):
             dest_key = f"{dest_prefix}{rel}"
             cli.upload_file(local_path, bucket, dest_key)
 
-# ---------------------------
-# Labels (MERGED)
-# ---------------------------
+CLASSES = ["Cargo","Tanker", "Fishing", "Passenger", "Leisure"]
 
-# Final 5-class list with merge
-CLASSES = ["Cargo", "Fishing", "Passenger", "Leisure", "Tanker"]
-
-# Any of these folder tokens map to Leisure
 LEISURE_ALIASES = {"Sailing", "Pleasure", "Leisure"}
 
+
 def parse_label_from_path(p: str) -> str:
-    """
-    Parse label from path segments. If any segment equals Sailing or Pleasure,
-    map it to Leisure. Backward-compatible with existing directory names.
-    """
     parts = set(p.replace("\\", "/").split("/"))
-    # direct hits first
+    # direct hits first (merged aliases)
     if LEISURE_ALIASES & parts:
         return "Leisure"
-    # otherwise check remaining classes
+
     for c in CLASSES:
         if c in parts:
             return c
-    # fallback: parent directory name -> apply Leisure mapping if needed
-    parent = p.replace("\\", "/").split("/")[-2]
-    return "Leisure" if parent in LEISURE_ALIASES else parent
 
-# ---------------------------
-# I/O helpers
-# ---------------------------
+    # fallback: parent directory name -> apply merge mapping if needed
+    parent = p.replace("\\", "/").split("/")[-2]
+    if parent in LEISURE_ALIASES:
+        return "Leisure"
+    return parent
 
 def _to_chw(arr: np.ndarray, expected_channels: int) -> np.ndarray:
     if arr.ndim == 2:
@@ -295,79 +258,59 @@ class S2Dataset(Dataset):
         return x, y
 
 # ---------------------------
-# Model: ResNet-50-ish
+# Model: ResNet-18-ish
 # ---------------------------
 
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
-class Bottleneck(nn.Module):
-    """ResNet-50/101 bottleneck block with expansion=4."""
-    expansion = 4
+class BasicBlock(nn.Module):
+    expansion = 1
     def __init__(self, inplanes, planes, stride=1, downsample=None):
         super().__init__()
-        # 1x1 reduce
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(planes)
-        # 3x3 conv (spatial)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(planes)
-        # 1x1 expand
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
-        self.bn3   = nn.BatchNorm2d(planes * self.expansion)
-
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
         self.downsample = downsample
-
     def forward(self, x):
         identity = x
         out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
+        out = self.bn2(self.conv2(out))
         if self.downsample is not None:
             identity = self.downsample(x)
         out += identity
         out = self.relu(out)
         return out
 
-class SmallResNet50(nn.Module):
-    """
-    ResNet-50 backbone adapted to N-channel input.
-    Stage blocks: [3, 4, 6, 3] using Bottleneck (expansion=4).
-    """
+class SmallResNet18(nn.Module):
+    """ResNet-18-ish backbone adapted to N-channel input."""
     def __init__(self, in_ch=4, num_classes=5):
         super().__init__()
         self.inplanes = 64
-        # First conv accepts N channels (e.g., 4 for B02,B03,B04,B08)
         self.conv1 = nn.Conv2d(in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1   = nn.BatchNorm2d(64)
         self.relu  = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # Layers with Bottleneck blocks
-        self.layer1 = self._make_layer(planes=64,  blocks=3, stride=1)  # output: 256 ch
-        self.layer2 = self._make_layer(planes=128, blocks=4, stride=2)  # output: 512 ch
-        self.layer3 = self._make_layer(planes=256, blocks=6, stride=2)  # output: 1024 ch
-        self.layer4 = self._make_layer(planes=512, blocks=3, stride=2)  # output: 2048 ch
-
+        self.layer1 = self._make_layer(64,  2, stride=1)
+        self.layer2 = self._make_layer(128, 2, stride=2)
+        self.layer3 = self._make_layer(256, 2, stride=2)
+        self.layer4 = self._make_layer(512, 2, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
-        self.fc = nn.Linear(512 * Bottleneck.expansion, num_classes)  # 512*4 = 2048
-
+        self.fc = nn.Linear(512*BasicBlock.expansion, num_classes)
     def _make_layer(self, planes, blocks, stride):
-        """Build a stage with `blocks` Bottleneck units."""
         downsample = None
-        out_channels = planes * Bottleneck.expansion
-        if stride != 1 or self.inplanes != out_channels:
+        if stride != 1 or self.inplanes != planes * BasicBlock.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
+                nn.Conv2d(self.inplanes, planes*BasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes*BasicBlock.expansion),
             )
-        layers = [Bottleneck(self.inplanes, planes, stride, downsample)]
-        self.inplanes = out_channels
+        layers = [BasicBlock(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes*BasicBlock.expansion
         for _ in range(1, blocks):
-            layers.append(Bottleneck(self.inplanes, planes, stride=1))
+            layers.append(BasicBlock(self.inplanes, planes))
         return nn.Sequential(*layers)
-
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
@@ -572,9 +515,6 @@ def train_one_fold(
         "best_state": best_state,
     }
 
-# ---------------------------
-# Main CV pipeline (NO GROUPS)
-# ---------------------------
 
 def main():
     cfg = load_config()
@@ -588,17 +528,28 @@ def main():
     out_root = os.path.join("results", f"cv_{ts}")
     os.makedirs(out_root, exist_ok=True)
 
-    # 1) Download dataset from S3 to local cache
     bucket = s3cfg["bucket"]; src_prefix = s3cfg["cv_dataset_prefix"]
     print(f"Listing S3: s3://{bucket}/{src_prefix}")
     keys = s3_list_keys(bucket, src_prefix)
     if not keys:
         raise RuntimeError("No .tif files found under cv_dataset_prefix.")
-    local_cache = "data_cache_cv"
-    print(f"Downloading {len(keys)} files to ./{local_cache} ...")
-    s3_download_to_tree(bucket, keys, src_prefix, local_cache)
 
-    # 2) Build manifest (path, label) with Leisure mapping
+    local_cache = "dataset"
+    os.makedirs(local_cache, exist_ok=True)
+
+    missing_keys = []
+    for k in keys:
+        rel = k[len(src_prefix):]
+        local_path = os.path.join(local_cache, rel)
+        if not os.path.exists(local_path):
+            missing_keys.append(k)
+
+    if missing_keys:
+        print(f"Downloading {len(missing_keys)}/{len(keys)} missing files to ./{local_cache} ...")
+        s3_download_to_tree(bucket, missing_keys, src_prefix, local_cache)
+    else:
+        print(f"Local cache is complete ({len(keys)} files). Skipping download.")
+
     files = glob.glob(os.path.join(local_cache, "**", "*.tif"), recursive=True) + \
             glob.glob(os.path.join(local_cache, "**", "*.tiff"), recursive=True)
     samples_all = []
@@ -606,9 +557,7 @@ def main():
         fname = os.path.basename(p).lower()
         if "tci" in fname: continue
         label_name = parse_label_from_path(p)
-        # Map any unknown Sailing/Pleasure tokens to Leisure handled in parser
         if label_name not in CLASSES:
-            # Unknown directory – skip silently to be safe
             continue
         label_idx = CLASSES.index(label_name)
         samples_all.append((p, label_idx))
@@ -617,15 +566,13 @@ def main():
         raise RuntimeError("No valid samples collected.")
     print(f"Collected {len(samples_all)} samples across classes: {dict(Counter([s[1] for s in samples_all]))}")
 
-    # Infer channel count from one sample
     test_arr = read_tif(samples_all[0][0], expected_channels=len(bands_order))
     in_ch = test_arr.shape[0]
     if len(bands_order) != in_ch:
         warnings.warn(f"bands_order length ({len(bands_order)}) != image channels ({in_ch}). "
                       f"Proceeding with {in_ch} channels (will use first {in_ch}).")
-    num_classes = len(CLASSES)  # 5
+    num_classes = len(CLASSES) 
 
-    # 3) Stratified K-Fold (NO GROUPS)
     train_frac, val_frac, test_frac = tr["train_val_test_split"]
     if abs(val_frac - test_frac) < 1e-6 and val_frac > 0:
         K = int(round(1.0 / val_frac))
@@ -635,7 +582,7 @@ def main():
     print(f"K-fold setup (no-group): K={K} (train/val/test target ~ {train_frac}/{val_frac}/{test_frac})")
 
     X = np.arange(len(samples_all))
-    y = np.array([s[1] for s in samples_all])  # merged labels
+    y = np.array([s[1] for s in samples_all])
 
     skf = StratifiedKFold(n_splits=K, shuffle=True, random_state=tr["seed"])
     fold_test_indices = [test_idx for _, test_idx in skf.split(X, y)]
@@ -680,7 +627,7 @@ def main():
             expected_channels=in_ch, device=device
         )
 
-        model = SmallResNet50(in_ch=in_ch, num_classes=num_classes).to(device)
+        model = SmallResNet18(in_ch=in_ch, num_classes=num_classes).to(device)
         fold_dir = os.path.join(out_root, f"fold_{r:02d}")
         os.makedirs(fold_dir, exist_ok=True)
 
@@ -696,7 +643,7 @@ def main():
         print(f"[Fold {r}] Train wall-time = {format_hms(fold_elapsed)} ({fold_elapsed:.1f}s)")
 
         if out["best_state"] is not None:
-            torch.save(out["best_state"], os.path.join(fold_dir, "best_model_resnet50.pth"))
+            torch.save(out["best_state"], os.path.join(fold_dir, "best_model.pth"))
 
         y_true = np.array(out["y_true_test"]); y_pred = np.array(out["y_pred_test"])
         acc = accuracy_score(y_true, y_pred)
@@ -726,7 +673,6 @@ def main():
             "weighted_f1": float(rep_dict["weighted avg"]["f1-score"]),
         })
 
-    # ---- CV summary ----
     df_cv = pd.DataFrame(cv_results)
     df_cv.to_csv(os.path.join(out_root, "cv_summary.csv"), index=False)
 
@@ -747,7 +693,6 @@ def main():
     with open(os.path.join(out_root, "cv_stats.json"), "w", encoding="utf-8") as f:
         json.dump(cv_stats, f, indent=2)
 
-    # Append timing info to summary file
     try:
         with open(os.path.join(out_root, "summary.txt"), "a", encoding="utf-8") as f:
             f.write(f"[Total] Training time: {format_hms(total_train_elapsed)} ({total_train_elapsed:.1f}s)\n")
@@ -756,7 +701,6 @@ def main():
     except Exception as _e:
         print("WARN: could not write summary.txt:", _e)
 
-    # Aggregate confusion
     plt.figure(figsize=(6,5))
     plt.imshow(agg_confusion, interpolation="nearest"); plt.title("Aggregate Confusion Matrix")
     plt.colorbar(); tick = np.arange(len(CLASSES))
@@ -771,7 +715,7 @@ def main():
     dest_prefix = f"{s3cfg['results_prefix']}cv_{ts}/"
     print(f"Uploading results to s3://{s3cfg['bucket']}/{dest_prefix} ...")
     s3_upload_dir(s3cfg["bucket"], out_root, dest_prefix)
-    print("Bitti.")
+    print("Done.")
 
 if __name__ == "__main__":
     main()

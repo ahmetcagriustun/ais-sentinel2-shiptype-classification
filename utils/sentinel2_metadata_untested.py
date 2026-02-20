@@ -10,20 +10,7 @@ def download_and_store_sentinel2_metadata(
     bbox=None,
     limit=100
 ):
-    """
-    Downloads Sentinel-2 metadata from Sentinel Hub API for the specified date range and bounding box,
-    and writes the results to the 'sentinel_metadata' table in PostgreSQL.
 
-    Args:
-        config_path (str): Path to the config.yaml file.
-        start_date (str): Start date-time in ISO format (UTC).
-        end_date (str): End date-time in ISO format (UTC).
-        bbox (list or None): [minLon, minLat, maxLon, maxLat]. If None, uses config file.
-        limit (int): Number of records per API page (max = 100).
-
-    Returns:
-        int: Number of records inserted into the database.
-    """
     config = load_config(config_path)
     
     if bbox is None:

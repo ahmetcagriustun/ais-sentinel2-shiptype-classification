@@ -8,9 +8,7 @@ def batch_insert_closest_mmsi_timestamps(
     truncate_existing: bool = False,
     time_window_minutes: int = 10,
 ) -> None:
-    """
-    Build or extend the closest_mmsi_timestamps table by iterating over Sentinel-2 api_id values.
-    """
+
     conn = psycopg2.connect(**db_conf)
     try:
         # Ensure target table exists (and optionally truncate)

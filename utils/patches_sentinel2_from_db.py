@@ -42,7 +42,7 @@ TRANSFER_CFG = TransferConfig(
 )
 
 def _slug(text: str) -> str:
-    """Create a safe, compact token from arbitrary text (e.g., 'Law enforcement')."""
+
     if text is None:
         return "NA"
     t = re.sub(r"\s+", "_", str(text).strip())
@@ -50,7 +50,7 @@ def _slug(text: str) -> str:
     return t or "NA"
 
 def make_s3_client(region: str | None = None, access_key_id: str | None = None, secret_access_key: str | None = None):
-    """Create a conservative S3 client with low connection pool to reduce memory spikes."""
+
     kwargs = {}
     if region:
         kwargs["region_name"] = region
@@ -73,7 +73,7 @@ def s3_key_join(prefix: str, *parts: str) -> str:
     return prefix or suffix
 
 def open_pg(db):
-    """Open a psycopg2 connection from a dict with {host, port, dbname, user, password}."""
+
     return psycopg2.connect(
         host=db["host"], port=db.get("port", 5432), dbname=db["dbname"], user=db["user"], password=db["password"],
     )
@@ -121,7 +121,7 @@ BAND_SUFFIX = {
 }
 
 def find_band_members_in_safe_zip(zip_path: Path, want_bands: list[str]) -> dict[str, str]:
-    """Return {band: member_path_inside_zip} for requested bands (B02,B03,B04,B08,TCI)."""
+
     want = set(want_bands)
     found: dict[str, str] = {}
     with zipfile.ZipFile(zip_path, "r") as z:
@@ -139,7 +139,7 @@ def find_band_members_in_safe_zip(zip_path: Path, want_bands: list[str]) -> dict
     return found
 
 def extract_members(zip_path: Path, members: dict[str, str], out_dir: Path) -> dict[str, Path]:
-    """Extract selected members from SAFE .zip to out_dir; return {band: local_path}."""
+
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
     with zipfile.ZipFile(zip_path, "r") as z:
@@ -153,7 +153,7 @@ def extract_members(zip_path: Path, members: dict[str, str], out_dir: Path) -> d
     return paths
 
 def lonlat_to_rowcol(src: rasterio.DatasetReader, lon: float, lat: float) -> tuple[int, int]:
-    """Transform (lon,lat) WGS84 into (row,col) of the given raster."""
+
     if src.crs is None:
         raise ValueError("Source raster has no CRS; cannot geolocate.")
     transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
@@ -167,7 +167,7 @@ def make_centered_window(row: int, col: int, size_px: int) -> Window:
 
 def write_multiband_geotiff(out_path: Path, ref_src: rasterio.DatasetReader, window: Window, arrays: list[np.ndarray],
                              dtype: str | None = None, meta_tags: dict | None = None):
-    """Write a multi-band GeoTIFF using ref_src window transform and CRS."""
+
     transform = ref_src.window_transform(window)
     height = int(window.height)
     width = int(window.width)
@@ -210,7 +210,7 @@ def process_one_product(
     save_tci: bool = True,
     skip_existing: bool = True,
 ):
-    """Process all points for a given api_id: download SAFE.zip, crop patches, upload, cleanup."""
+
     safe_zip_key = s3_key_join(s3_sentinel_prefix, f"{api_id}.zip")
     local_zip = work_dir / f"{api_id}.zip"
 
