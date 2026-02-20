@@ -205,3 +205,16 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Local data & experiment outputs (do NOT push to GitHub)
+data_cache_cv/
+dataset/
+delete_models/
+downloads/
+outputs/
+outputs_resnet18_cv_6class/
+outputs_resnet18_cv_cargo_tanker/
+outputs_resnet18_cv_pleasure_sailing/
+results/
+runs/
+umap_outputs/
+config.yaml
