@@ -1,3 +1,9 @@
+sentinel_hub:
+  auth_url: "https://services.sentinel-hub.com/oauth/token"
+  catalog_url: "https://services.sentinel-hub.com/api/v1/catalog/search"
+  client_id: "<sentinelhub-client-id>"
+  client_secret: "<sentinelhub-client-secret>"
+
 ais:
   base_url: "http://aisdata.ais.dk"
 

@@ -25,6 +25,7 @@ High-level structure (relevant for running the pipeline):
 ├── main.py                       # CLI entry point (AIS–Sentinel-2 pipeline)
 ├── config.yaml                   # Global configuration (DB, S3, project, training, cleaner)
 ├── sql/
+│   ├── sentinel2_metadata_geom_and_water_area.sql
 │   ├── sentinel2_metadata_select.sql
 │   ├── create-sentinel_download_index_geom.sql
 │   ├── create_ais_download_list.sql
@@ -71,6 +72,8 @@ High-level structure (relevant for running the pipeline):
   - The pipeline currently targets the `http://aisdata.ais.dk` layout (daily/monthly ZIPs).
 - Sentinel-2 data source:
   - Copernicus Data Space / Sentinel-2 SAFE products (downloaded to S3).
+-Sentinel-2 metadata source:
+  -Sentinel Hub Catalog (STAC API) via OAuth2 client credentials (sentinel_hub.* in config).
 
 Python dependencies (non-exhaustive):
 
@@ -87,6 +90,12 @@ All credentials, S3 paths, and training hyperparameters are set in `config.yaml`
 A typical structure:
 
 ```yaml
+sentinel_hub:
+  auth_url: "https://services.sentinel-hub.com/oauth/token"
+  catalog_url: "https://services.sentinel-hub.com/api/v1/catalog/search"
+  client_id: "<sentinelhub-client-id>"
+  client_secret: "<sentinelhub-client-secret>"
+  
 ais:
   base_url: "http://aisdata.ais.dk"
 
@@ -198,6 +207,7 @@ python main.py db.exec-sql-batch \
 Some frequently used `db.exec-sql` examples:
 
 ```bash
+python main.py db.exec-sql --sql-file sql/sentinel2_metadata_geom_and_water_area.sql
 python main.py db.exec-sql --sql-file sql/sql_create_point_geom.sql
 python main.py db.exec-sql --sql-file sql/sql_create_sensing_time_without_tz.sql
 python main.py db.exec-sql --sql-file sql/sql_create_index_sentinel.sql
@@ -212,6 +222,19 @@ python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_open_sea.s
 ---
 
 ## 6. Sentinel-2 workflow
+
+python main.py --config config.yaml s2.metadata-download \
+  --start-date "2024-06-01T00:00:00Z" \
+  --end-date "2024-06-02T00:00:00Z" \
+  --bbox "minLon,minLat,maxLon,maxLat" \
+  --limit 50 \
+  --table "public.sentinel_metadata_all"
+
+-Downloads Sentinel-2 L2A STAC metadata from Sentinel Hub Catalog API.
+
+-Inserts results into public.sentinel_metadata_all (or a user-provided table).
+
+---bbox is optional; if omitted, uses project.region_bbox from config.
 
 ### 6.1. Select Sentinel-2 scenes
 
@@ -674,5 +697,20 @@ python train_cnn3-4_resnet34.py   # 4-class setup, ResNet-34
 python train_cnn3-5_resnet18.py   # 5-class setup, ResNet-18
 python train_cnn3-6_resnet18.py   # 6-class setup, ResNet-18
 
+## Notes on external services and API stability
 
+-AIS provider endpoints, file naming conventions, and availability may change over time.
 
+-Copernicus Data Space and Sentinel Hub APIs (OAuth/token endpoints, Catalog/STAC responses, pagination format) may evolve.
+
+-If requests start failing (401/403/5xx/400), review:
+
+    -credentials in config.yaml
+
+    -API endpoints (sentinel_hub.auth_url, sentinel_hub.catalog_url)
+
+    -pagination logic and required request parameters
+
+    -rate limits / service incidents
+
+-This repository prioritizes reproducibility, but maintenance updates may be required to keep integrations working.

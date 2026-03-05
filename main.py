@@ -42,6 +42,26 @@ from utils.ais_download import download_ais_zips_from_dates
 from utils.s3_utils import list_s3_zip_files
 from utils.ais_parser import process_zip_s3_to_pg_disk,filter_ais_zip_keys
 from utils.closest_mmsi_timestamps_utils import batch_insert_closest_mmsi_timestamps
+from utils.sentinel2_metadata_download import download_and_store_sentinel2_metadata
+
+def cmd_s2_metadata_download(args):
+    bbox = None
+    if args.bbox:
+        # Parse bbox string into float list: "minLon,minLat,maxLon,maxLat"
+        parts = [p.strip() for p in args.bbox.split(",")]
+        if len(parts) != 4:
+            raise SystemExit("[s2.metadata-download] --bbox must be 4 comma-separated numbers: minLon,minLat,maxLon,maxLat")
+        bbox = [float(x) for x in parts]
+
+    n = download_and_store_sentinel2_metadata(
+        config_path=args.config,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        bbox=bbox,
+        limit=args.limit,
+        table_name=args.table,
+    )
+    print(f"[s2.metadata-download] DONE. wrote={n} table={args.table}")
 
 def cmd_s2_select_file(args):
     sql_file = args.sql_file
@@ -345,6 +365,25 @@ def build_parser():
     )
     p.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     sub = p.add_subparsers(dest="command", required=True)
+
+    # s2.metadata-download
+    md = sub.add_parser(
+        "s2.metadata-download",
+        help="Download Sentinel-2 STAC metadata (Sentinel Hub) and store into Postgres.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    md.add_argument("--start-date", default=None,
+                    help="Start datetime (e.g., 2024-06-01T00:00:00Z). If omitted, uses config.project.start_date.")
+    md.add_argument("--end-date", default=None,
+                    help="End datetime (e.g., 2024-06-02T00:00:00Z). If omitted, uses config.project.end_date.")
+    md.add_argument("--bbox", default=None,
+                    help="Override bbox as 'minLon,minLat,maxLon,maxLat'. If omitted, uses config.project.region_bbox.")
+    md.add_argument("--limit", type=int, default=100,
+                    help="STAC page size (limit).")
+    md.add_argument("--table", default="public.sentinel_metadata_all",
+                    help="Target Postgres table to insert metadata.")
+    md.set_defaults(func=cmd_s2_metadata_download)
+    
 
     # s2.select-file
     sf = sub.add_parser("s2.select-file", help="Run SQL file to build selected scenes tables.",
