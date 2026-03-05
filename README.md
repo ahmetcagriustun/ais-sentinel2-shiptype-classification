@@ -57,6 +57,7 @@ High-level structure (relevant for running the pipeline):
 ├── train_cnn3-5_resnet18.py
 └── train_cnn3-6_resnet18.py           # Training scripts for different class setups
 ```
+
 ---
 
 ## 2. Prerequisites
@@ -72,8 +73,8 @@ High-level structure (relevant for running the pipeline):
   - The pipeline currently targets the `http://aisdata.ais.dk` layout (daily/monthly ZIPs).
 - Sentinel-2 data source:
   - Copernicus Data Space / Sentinel-2 SAFE products (downloaded to S3).
--Sentinel-2 metadata source:
-  -Sentinel Hub Catalog (STAC API) via OAuth2 client credentials (sentinel_hub.* in config).
+- Sentinel-2 metadata source:
+  - Sentinel Hub Catalog (STAC API) via OAuth2 client credentials (`sentinel_hub.*` in config).
 
 Python dependencies (non-exhaustive):
 
@@ -95,7 +96,7 @@ sentinel_hub:
   catalog_url: "https://services.sentinel-hub.com/api/v1/catalog/search"
   client_id: "<sentinelhub-client-id>"
   client_secret: "<sentinelhub-client-secret>"
-  
+
 ais:
   base_url: "http://aisdata.ais.dk"
 
@@ -131,6 +132,9 @@ s3:
   # Re-bucketed training patches by ship type
   dest_training_by_type_prefix: "training-patches-ship-type-opensea/"
 
+  # Cross-validation dataset prefix expected by training scripts
+  cv_dataset_prefix: "training-patches-ship-type-opensea/"
+
   # Results & reports
   results_prefix: "results/"
 
@@ -160,6 +164,7 @@ quality:
   nir_threshold: 0.65
   ndvi_upper_for_cloud: 0.25
 ```
+
 ---
 
 ## 4. High-level pipeline
@@ -186,63 +191,186 @@ All steps are operated via `main.py`.
 
 ---
 
-## 5. Database initialization
+## 5. End-to-end workflow (step-by-step)
+
+This section provides a runnable, ordered command list that reproduces the full pipeline from metadata download to model training.
+
+> **Note**
+> - All commands assume you are in the repository root.
+> - Most commands read defaults from `config.yaml` (DB credentials, S3 bucket/prefixes, project dates/bbox, etc.).
+> - SQL scripts are located under `sql/`.
+
+### 5.1. Sentinel-2 metadata → geometry & water area
+
+1) Download Sentinel-2 metadata to Postgres:
 
 ```bash
-# Run all SQL files under sql/ (in alphanumeric order)
-python main.py db.exec-sql-batch \
-  --folder sql \
-  --single-transaction
+python main.py --config config.yaml s2.metadata-download
 ```
 
-To filter only a subset (e.g., only `sql_create_*` files):
+2) Compute scene geometry and open-water area:
 
 ```bash
-python main.py db.exec-sql-batch \
-  --folder sql \
-  --pattern sql_create_ \
-  --single-transaction
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sentinel2_metadata_geom_and_water_area.sql
 ```
 
-Some frequently used `db.exec-sql` examples:
+### 5.2. Select Sentinel-2 products and download SAFE archives
+
+3) Select scenes to use (creates a “selected” table):
 
 ```bash
-python main.py db.exec-sql --sql-file sql/sentinel2_metadata_geom_and_water_area.sql
-python main.py db.exec-sql --sql-file sql/sql_create_point_geom.sql
-python main.py db.exec-sql --sql-file sql/sql_create_sensing_time_without_tz.sql
-python main.py db.exec-sql --sql-file sql/sql_create_index_sentinel.sql
-python main.py db.exec-sql --sql-file sql/sql_create_index_ais1.sql
-python main.py db.exec-sql --sql-file sql/sql_create_index_ais2.sql
-python main.py db.exec-sql --sql-file sql/sql_create_index_ais3.sql
-python main.py db.exec-sql --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
-python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_table.sql
-python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_open_sea.sql
+python main.py --config config.yaml s2.select-file   --sql-file sql/sentinel2_metadata_select.sql
+```
+
+4) Download selected SAFE archives and upload to S3:
+
+```bash
+python main.py --config config.yaml s2.download   --table sentinel_metadata_selected   --column api_id   --out-dir ./downloads
+```
+
+### 5.3. Build Sentinel-2 download index (+ geometry)
+
+5) Build download index from S3 SAFE ZIPs:
+
+```bash
+python main.py --config config.yaml s2.build-download-index   --table sentinel_download_index
+```
+
+6) Create/populate the geometry version of the index table:
+
+```bash
+python main.py --config config.yaml s2.build-download-index-geom   --sql-file sql/create-sentinel_download_index_geom.sql
+```
+
+### 5.4. AIS download → parse → point geometry
+
+7) Create AIS download list:
+
+```bash
+python main.py --config config.yaml ais.build-list   --sql-file sql/create_ais_download_list.sql
+```
+
+8) Download AIS ZIPs to S3:
+
+```bash
+python main.py --config config.yaml ais.download   --table ais_download_list   --date-col date
+```
+
+9) Parse AIS ZIPs from S3 into Postgres:
+
+```bash
+python main.py --config config.yaml ais.parse-s3   --table ship_raw_data   --start-date 2024-01-01   --end-date 2025-01-01
+```
+
+10) Create PostGIS point geometry for AIS rows:
+
+```bash
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sql_create_point_geom.sql
+```
+
+### 5.5. Sensing time, indexes, closest timestamps
+
+11) Standardize Sentinel sensing time:
+
+```bash
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sql_create_sensing_time_without_tz.sql
+```
+
+12) Create performance indexes:
+
+```bash
+python main.py --config config.yaml db.exec-sql --sql-file sql/sql_create_index_sentinel.sql
+python main.py --config config.yaml db.exec-sql --sql-file sql/sql_create_index_ais1.sql
+python main.py --config config.yaml db.exec-sql --sql-file sql/sql_create_index_ais2.sql
+python main.py --config config.yaml db.exec-sql --sql-file sql/sql_create_index_ais3.sql
+```
+
+13) Create closest timestamp table (SQL definition):
+
+```bash
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
+```
+
+> If your pipeline fills closest timestamps via Python, run:
+```bash
+python main.py --config config.yaml db.build-closest   --time-window-minutes 10   --truncate
+```
+
+### 5.6. Prediction points → open-sea filtering
+
+14) Create prediction points:
+
+```bash
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sql_create_prediction_point_table.sql
+```
+
+15) Filter prediction points to open-sea subset:
+
+```bash
+python main.py --config config.yaml db.exec-sql   --sql-file sql/sql_create_prediction_point_open_sea.sql
+```
+
+### 5.7. Patch generation → rebucket → cloud cleaning
+
+16) Build Sentinel-2 patches:
+
+```bash
+python main.py --config config.yaml patches.build   --table public.ship_prediction_point_open_sea   --patch-size-px 128   --bands B02 B03 B04 B08   --save-tci
+```
+
+17) Re-bucket patches into ship-type folders:
+
+```bash
+python main.py --config config.yaml patches.rebucket
+```
+
+18) Remove cloudy patches (legacy direct script call):
+
+```bash
+python utils/clean_cloudy_s3.py
+```
+
+> If you prefer using the main CLI wrapper instead:
+```bash
+python main.py --config config.yaml patches.clean-cloudy   --bright-thresh 0.85   --max-cloud-ratio 0.20
+```
+
+### 5.8. Train CNN models
+
+19) Train (example):
+
+```bash
+python train_cnn3-4_resnet18.py
+```
+
+Other configurations:
+
+```bash
+python train_cnn3-4_resnet34.py
+python train_cnn3-5_resnet18.py
+python train_cnn3-6_resnet18.py
 ```
 
 ---
 
 ## 6. Sentinel-2 workflow
 
-python main.py --config config.yaml s2.metadata-download \
-  --start-date "2024-06-01T00:00:00Z" \
-  --end-date "2024-06-02T00:00:00Z" \
-  --bbox "minLon,minLat,maxLon,maxLat" \
-  --limit 50 \
-  --table "public.sentinel_metadata_all"
+Download metadata into a base table (example):
 
--Downloads Sentinel-2 L2A STAC metadata from Sentinel Hub Catalog API.
+```bash
+python main.py --config config.yaml s2.metadata-download   --start-date "2024-06-01T00:00:00Z"   --end-date "2024-06-02T00:00:00Z"   --bbox "minLon,minLat,maxLon,maxLat"   --limit 50   --table "public.sentinel_metadata_all"
+```
 
--Inserts results into public.sentinel_metadata_all (or a user-provided table).
-
----bbox is optional; if omitted, uses project.region_bbox from config.
+- Downloads Sentinel-2 L2A STAC metadata from the Sentinel Hub Catalog API.
+- Inserts results into `public.sentinel_metadata_all` (or a user-provided table).
+- `--bbox` is optional; if omitted, uses `project.region_bbox` from config.
 
 ### 6.1. Select Sentinel-2 scenes
 
 Use a SQL script (e.g. `sql/sentinel2_metadata_select.sql`) to select Sentinel-2 products over your region/time window into `sentinel_metadata_selected`:
 
 ```bash
-python main.py s2.select-file \
-  --sql-file sql/sentinel2_metadata_select.sql
+python main.py s2.select-file   --sql-file sql/sentinel2_metadata_select.sql
 ```
 
 This typically:
@@ -256,10 +384,7 @@ This typically:
 Download all selected product names from Postgres and upload SAFE ZIPs to S3:
 
 ```bash
-python main.py s2.download \
-  --table sentinel_metadata_selected \
-  --column api_id \
-  --out-dir ./downloads
+python main.py s2.download   --table sentinel_metadata_selected   --column api_id   --out-dir ./downloads
 ```
 
 Behavior:
@@ -273,8 +398,7 @@ Behavior:
 Scan S3 for SAFE ZIPs and populate `sentinel_download_index`:
 
 ```bash
-python main.py s2.build-download-index \
-  --table sentinel_download_index
+python main.py s2.build-download-index   --table sentinel_download_index
   # --prefix can override config.s3.sentinel2_prefix if needed
 ```
 
@@ -289,8 +413,7 @@ This will:
 Create/populate `sentinel_download_index_geom` (e.g., adding geometries):
 
 ```bash
-python main.py s2.build-download-index-geom \
-  --sql-file sql/create-sentinel_download_index_geom.sql
+python main.py s2.build-download-index-geom   --sql-file sql/create-sentinel_download_index_geom.sql
 ```
 
 This SQL script is responsible for:
@@ -308,8 +431,7 @@ This SQL script is responsible for:
 Create `ais_download_list` from `sentinel_download_index_geom` (time/space envelope around Sentinel-2 scenes):
 
 ```bash
-python main.py ais.build-list \
-  --sql-file sql/create_ais_download_list.sql
+python main.py ais.build-list   --sql-file sql/create_ais_download_list.sql
 ```
 
 The script typically defines:
@@ -322,9 +444,7 @@ The script typically defines:
 Use the download list to fetch AIS ZIPs and upload them to S3:
 
 ```bash
-python main.py ais.download \
-  --table ais_download_list \
-  --date-col date
+python main.py ais.download   --table ais_download_list   --date-col date
   # --prefix to override config.s3.raw_data_prefix if needed
 ```
 
@@ -337,17 +457,12 @@ This calls `utils.ais_download.download_ais_zips_from_dates` and:
 
 Parse AIS CSVs inside ZIP archives directly from S3 into `ship_raw_data` (via `COPY`).
 
-Examples (from `main.py` header):
+Examples:
 
 ```bash
-python main.py ais.parse-s3 \
-  --table ship_raw_data \
-  --start-date 2024-01-01 \
-  --end-date 2025-01-01
+python main.py ais.parse-s3   --table ship_raw_data   --start-date 2024-01-01   --end-date 2025-01-01
 
-python main.py ais.parse-s3 \
-  --table ship_raw_data \
-  --key-contains "aisdk-2023-12"
+python main.py ais.parse-s3   --table ship_raw_data   --key-contains "aisdk-2023-12"
 ```
 
 General behavior:
@@ -373,8 +488,7 @@ Useful options:
 Use the dedicated SQL script to create the table and any needed indices:
 
 ```bash
-python main.py db.exec-sql \
-  --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
+python main.py db.exec-sql   --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
 ```
 
 This script typically defines:
@@ -389,7 +503,7 @@ Use the dedicated command to fill the table, based on:
 - `ship_raw_data` (AIS),
 - `sentinel_download_index_geom` (Sentinel-2 products and footprints).
 
-Example (from `main.py` header):
+Example:
 
 ```bash
 python main.py db.build-closest --time-window-minutes 10
@@ -398,9 +512,7 @@ python main.py db.build-closest --time-window-minutes 10
 More options:
 
 ```bash
-python main.py db.build-closest \
-  --time-window-minutes 10 \
-  --truncate
+python main.py db.build-closest   --time-window-minutes 10   --truncate
 ```
 
 Arguments:
@@ -419,21 +531,19 @@ Create prediction points at Sentinel sensing time (e.g., by linearly interpolati
 ### 9.1. Create prediction point table
 
 ```bash
-python main.py db.exec-sql \
-  --sql-file sql/sql_create_prediction_point_table.sql
+python main.py db.exec-sql   --sql-file sql/sql_create_prediction_point_table.sql
 ```
 
 ### 9.2. Filter to open-sea subset
 
 ```bash
-python main.py db.exec-sql \
-  --sql-file sql/sql_create_prediction_point_open_sea.sql
+python main.py db.exec-sql   --sql-file sql/sql_create_prediction_point_open_sea.sql
 ```
 
 After these steps, you typically have tables like:
 
-- `ship_predicted_positions`  
-- `ship_predicted_positions_open_sea`
+- `ship_prediction_point`  
+- `ship_prediction_point_open_sea`
 
 which are then used to drive patch extraction.
 
@@ -443,37 +553,20 @@ which are then used to drive patch extraction.
 
 Use the `patches.build` command to generate ship-centered Sentinel-2 patches on S3.
 
-Example (from `main.py` header):
+Example:
 
 ```bash
-python main.py --config config.yaml patches.build \
-  --table public.ship_predicted_positions \
-  --patch-size-px 128 \
-  --bands B02 B03 B04 B08 \
-  --save-tci \
-  --log-level INFO
-```
-
-More generally:
-
-```bash
-python main.py patches.build \
-  --table public.ship_predicted_positions_open_sea \
-  --patch-size-px 128 \
-  --bands B02 B03 B04 B08 \
-  --save-tci
+python main.py --config config.yaml patches.build   --table public.ship_prediction_point_open_sea   --patch-size-px 128   --bands B02 B03 B04 B08   --save-tci   --log-level INFO
 ```
 
 Parameters:
 
-- `--table` – source prediction point table  
-  (e.g., `public.ship_predicted_positions_open_sea`),
+- `--table` – source prediction point table (e.g., `public.ship_prediction_point_open_sea`),
 - `--patch-size-px` – patch size in pixels (square patch),
 - `--bands` – list of bands to extract, ordered as in `bands_order`,
 - `--save-tci` – additionally save TCI images for quick visual inspection,
 - `--log-level` – logging level for the underlying patch builder,
-- `--extra` – forwarded verbatim to `utils.patches_sentinel2_from_db`  
-  (e.g., `--limit`, `--overwrite`).
+- `--extra` – forwarded verbatim to `utils.patches_sentinel2_from_db` (e.g., `--limit`, `--overwrite`).
 
 The patches are uploaded to S3 under `s3.training_dataset_prefix`.
 
@@ -484,39 +577,20 @@ The patches are uploaded to S3 under `s3.training_dataset_prefix`.
 The recommended way is via `main.py`:
 
 ```bash
-python main.py patches.clean-cloudy \
-  --bright-thresh 0.85 \
-  --max-cloud-ratio 0.20
+python main.py patches.clean-cloudy   --bright-thresh 0.85   --max-cloud-ratio 0.20
+```
+
+---
 
 ## 12. Re-bucketing patches by ship type
 
 Once you have a cloud-cleaned patch set, you can re-arrange S3 keys so each class lives under its own prefix (useful for training).
 
-Simple call (from `main.py` header):
+Simple call:
 
 ```bash
 python main.py patches.rebucket
 ```
-
-More explicit example:
-
-```bash
-python main.py patches.rebucket \
-  --extra --source s3://<bucket>/training-patches-ship-predicted-positions/ \
-          --dest   s3://<bucket>/training-patches-ship-type-opensea/
-```
-
-Internally this call delegates to:
-
-```bash
-python -m utils.rebucket_by_ship_type \
-  --source ... \
-  --dest ... \
-  --map-file class_map.yaml \
-  --dry-run
-```
-
-Refer to `utils/rebucket_by_ship_type.py` for the available CLI options.
 
 ---
 
@@ -532,16 +606,11 @@ python train_cnn3-6_resnet18.py
 
 This script typically:
 
-1. Uses `cfg["s3"]["cv_dataset_prefix"]` (or similar) to locate the re-bucketed dataset on S3.
+1. Uses `cfg["s3"]["cv_dataset_prefix"]` to locate the re-bucketed dataset on S3.
 2. Downloads the dataset locally under `results/cv_<timestamp>/data_cache/`.
-3. Builds a 6-class label taxonomy (e.g., Cargo, Tanker, Fishing, Passenger, Sailing, Pleasure).
+3. Builds a label taxonomy (e.g., 6-class setup).
 4. Performs stratified K-fold cross-validation (K inferred from configuration).
-5. Trains a ResNet-18 backbone, logging:
-   - Fold-wise and overall accuracy,
-   - Class-wise precision/recall/F1,
-   - Confusion matrices,
-   - Loss curves.
-6. Saves metrics (JSON/CSV) and plots (PNG) under `results/cv_<timestamp>/`.
+5. Trains a ResNet backbone and saves metrics/plots under `results/cv_<timestamp>/`.
 
 Other training scripts (`train_cnn3-4_resnet18.py`, `train_cnn3-4_resnet34.py`, `train_cnn3-5_resnet18.py`) follow the same pattern but differ in:
 
@@ -555,6 +624,9 @@ python train_cnn3-4_resnet18.py
 python train_cnn3-4_resnet34.py
 python train_cnn3-5_resnet18.py
 ```
+
+---
+
 ## 14. Command reference
 
 Quick reference for all `main.py` sub-commands:
@@ -564,311 +636,37 @@ Quick reference for all `main.py` sub-commands:
 python main.py --config config.yaml <command> [...]
 
 # Sentinel-2
-python main.py s2.select-file \
-  --sql-file sql/sentinel2_metadata_select.sql
-
-python main.py s2.download \
-  --table sentinel_metadata_selected \
-  --column api_id \
-  --out-dir ./downloads
-
-python main.py s2.build-download-index \
-  --table sentinel_download_index \
-  [--prefix <s3-prefix>]
-
-python main.py s2.build-download-index-geom \
-  --sql-file sql/create-sentinel_download_index_geom.sql
+python main.py s2.metadata-download [...]
+python main.py s2.select-file --sql-file sql/sentinel2_metadata_select.sql
+python main.py s2.download --table sentinel_metadata_selected --column api_id --out-dir ./downloads
+python main.py s2.build-download-index --table sentinel_download_index
+python main.py s2.build-download-index-geom --sql-file sql/create-sentinel_download_index_geom.sql
 
 # AIS
-python main.py ais.build-list \
-  --sql-file sql/create_ais_download_list.sql
-
-python main.py ais.download \
-  --table ais_download_list \
-  --date-col date \
-  [--prefix <s3-prefix>]
-
-python main.py ais.parse-s3 \
-  --table ship_raw_data \
-  [--start-date YYYY-MM-DD] \
-  [--end-date YYYY-MM-DD] \
-  [--key-contains STR] \
-  [--prefix <s3-prefix>]
+python main.py ais.build-list --sql-file sql/create_ais_download_list.sql
+python main.py ais.download --table ais_download_list --date-col date
+python main.py ais.parse-s3 --table ship_raw_data [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--key-contains STR]
 
 # AIS–Sentinel association & DB utilities
-python main.py db.build-closest \
-  --time-window-minutes 10 \
-  [--no-create] \
-  [--truncate] \
-  [--quiet]
-
-python main.py db.exec-sql \
-  --sql-file path/to/file.sql
-
-python main.py db.exec-sql-batch \
-  --folder sql \
-  [--pattern PATTERN] \
-  [--single-transaction]
+python main.py db.build-closest --time-window-minutes 10 [--truncate]
+python main.py db.exec-sql --sql-file path/to/file.sql
+python main.py db.exec-sql-batch --folder sql [--pattern PATTERN] [--single-transaction]
 
 # Patches
-python main.py patches.build \
-  --table public.ship_predicted_positions_open_sea \
-  --patch-size-px 128 \
-  --bands B02 B03 B04 B08 \
-  [--save-tci] \
-  [--log-level INFO] \
-  [--extra ...]
-
-python main.py patches.clean-cloudy \
-  --bright-thresh 0.85 \
-  --max-cloud-ratio 0.20 \
-  [--extra ...]
-
-python main.py patches.rebucket \
-  [--extra ...]
-```
-## 15. Usage examples
-
-For convenience, here is the full set of usage examples as documented in the top-level comment of `main.py`:
-
-Commands
---------
-- s2.select-file                 : run SQL selection (sql/sentinel2_metadata_select.sql)
-- s2.download                    : read product names from Postgres and call downloader
-- s2.build-download-index        : scan S3 zips -> sentinel_download_index table (HTML/XML sensing_time)
-- s2.build-download-index-geom   : run SQL to create/populate sentinel_download_index_geom
-- ais.build-list                 : run SQL to create ais_download_list
-- ais.download                   : download AIS zips to S3 by dates from ais_download_list
-- ais.parse-s3                   : iterate S3 AIS ZIPs and insert rows into Postgres via COPY
-
-# AIS parsing examples
-python main.py ais.parse-s3 \
-  --table ship_raw_data \
-  --start-date 2024-01-01 \
-  --end-date 2025-01-01
-
-python main.py ais.parse-s3 \
-  --table ship_raw_data \
-  --key-contains "aisdk-2023-12"
-                                      
-- db.exec-sql                    : execute a single SQL file on the configured database
-                                    python main.py db.exec-sql --sql-file sql/sql_create_point_geom.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_sensing_time_without_tz.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_index_sentinel.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais1.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais2.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_index_ais3.sql                                  
-                                    python main.py db.exec-sql --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_table.sql
-                                    python main.py db.exec-sql --sql-file sql/sql_create_prediction_point_open_sea.sql
-
-
-- db.build-closest: create closest time stamp table.
-# Closest MMSI timestamps examples
-python main.py db.build-closest --time-window-minutes 10
-
-# Patch building
-python main.py --config config.yaml patches.build \
-  --table public.ship_predicted_positions \
-  --patch-size-px 128 \
-  --bands B02 B03 B04 B08 \
-  --save-tci \
-  --log-level INFO
-
-# Re-bucketing
+python main.py patches.build --table public.ship_prediction_point_open_sea --patch-size-px 128 --bands B02 B03 B04 B08 [--save-tci]
+python main.py patches.clean-cloudy --bright-thresh 0.85 --max-cloud-ratio 0.20
 python main.py patches.rebucket
+```
 
-# Cloud cleaning
-python main.py patches.clean-cloudy \
-  --bright-thresh 0.85 \
-  --max-cloud-ratio 0.20
-
-# Cloud cleaning (legacy direct call)
-python -m utils.clean_cloudy_s3 \
-  --config config.yaml \
-  --bright-thresh 0.85 \
-  --max-cloud-ratio 0.20
-
-
-# Generic training example (for a unified script)
-
-python train_cnn3-4_resnet18.py   # 4-class setup, ResNet-18
-python train_cnn3-4_resnet34.py   # 4-class setup, ResNet-34
-python train_cnn3-5_resnet18.py   # 5-class setup, ResNet-18
-python train_cnn3-6_resnet18.py   # 6-class setup, ResNet-18
+---
 
 ## Notes on external services and API stability
 
--AIS provider endpoints, file naming conventions, and availability may change over time.
-
--Copernicus Data Space and Sentinel Hub APIs (OAuth/token endpoints, Catalog/STAC responses, pagination format) may evolve.
-
--If requests start failing (401/403/5xx/400), review:
-
-    -credentials in config.yaml
-
-    -API endpoints (sentinel_hub.auth_url, sentinel_hub.catalog_url)
-
-    -pagination logic and required request parameters
-
-    -rate limits / service incidents
-
--This repository prioritizes reproducibility, but maintenance updates may be required to keep integrations working.
-
-End-to-End Processing Workflow
-
-This section describes the complete workflow used to construct the training dataset and train the ship classification models.
-All steps can be executed using the main.py command-line interface together with the SQL scripts provided in the sql/ directory.
-
-The workflow integrates Sentinel-2 imagery, AIS vessel messages, and PostGIS spatial processing to generate labeled image patches for ship type classification.
-
-1. Download Sentinel-2 Metadata
-
-First, Sentinel-2 metadata records covering the study area and time period are downloaded and stored in the PostgreSQL/PostGIS database.
-
-python main.py --config config.yaml s2.metadata-download
-2. Compute Scene Geometry and Water Area
-
-Scene footprints are generated and the open-water area within each Sentinel-2 scene is calculated.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sentinel2_metadata_geom_and_water_area.sql
-3. Select Sentinel-2 Scenes
-
-Scenes suitable for analysis are selected based on predefined criteria (e.g., cloud coverage and water area).
-
-This step creates a new table containing the selected scenes.
-
-python main.py --config config.yaml s2.select-file \
-  --sql-file sql/sentinel2_meta_select.sql
-4. Download Selected Sentinel-2 Images
-
-The selected Sentinel-2 products are downloaded from the Copernicus Data Space and uploaded to the configured S3 bucket.
-
-python main.py --config config.yaml s2.download \
-  --table sentinel2_meta_selected \
-  --column api_id
-5. Build Sentinel-2 Download Index
-
-An index table describing the downloaded Sentinel-2 products is created.
-
-python main.py --config config.yaml s2.build-download-index \
-  --table sentinel_download_index
-6. Generate Geometry for Download Index
-
-Scene geometries are added to the download index table.
-
-python main.py --config config.yaml s2.build-download-index-geom \
-  --sql-file sql/create-sentinel_download_index_geom.sql
-7. Determine Required AIS Files
-
-AIS archives corresponding to the Sentinel-2 acquisition dates are identified.
-
-python main.py --config config.yaml ais.build-list \
-  --sql-file sql/create_ais_download_list.sql
-8. Download AIS Archives
-
-AIS archives are downloaded and stored in the configured S3 bucket.
-
-python main.py --config config.yaml ais.download \
-  --table ais_download_list \
-  --date-col date
-9. Parse AIS Data
-
-AIS ZIP archives stored in S3 are parsed and inserted into the PostgreSQL database.
-
-python main.py --config config.yaml ais.parse-s3 \
-  --table ship_raw_data \
-  --start-date 2024-01-01 \
-  --end-date 2025-01-01
-10. Create AIS Point Geometry
-
-AIS latitude and longitude values are converted into PostGIS point geometries.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_point_geom.sql
-11. Create Sentinel-2 Sensing Time
-
-Sentinel-2 sensing timestamps are generated and standardized.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_sensing_time_without_tz.sql
-12. Create Spatial and Temporal Indexes
-
-Indexes are created to improve spatial and temporal query performance.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_index_sentinel.sql
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_index_ais1.sql
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_index_ais2.sql
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_index_ais3.sql
-13. Compute Closest AIS Timestamps
-
-AIS messages closest to each Sentinel-2 sensing time are identified.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
-14. Create Ship Prediction Points
-
-Estimated vessel positions at Sentinel-2 acquisition times are calculated.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_prediction_point_table.sql
-15. Filter Open-Sea Prediction Points
-
-Only vessels located in open water are retained.
-
-python main.py --config config.yaml db.exec-sql \
-  --sql-file sql/sql_create_prediction_point_open_sea.sql
-16. Generate Sentinel-2 Image Patches
-
-Image patches centered on predicted ship locations are extracted from Sentinel-2 scenes.
-
-python main.py --config config.yaml patches.build \
-  --table public.ship_prediction_point_open_sea \
-  --patch-size-px 128 \
-  --bands B02 B03 B04 B08 \
-  --save-tci
-17. Reorganize Patch Dataset by Ship Type
-
-The generated patches are reorganized into ship-type-based folder structures.
-
-python main.py --config config.yaml patches.rebucket
-18. Remove Cloudy Image Patches
-
-Cloud-contaminated patches are detected and removed from the dataset.
-
-python utils/clean_cloudy_s3.py
-19. Train the Classification Model
-
-The CNN model is trained using the generated Sentinel-2 patch dataset.
-
-Example training command:
-
-python train_cnn3-4_resnet18.py
-
-Alternative model configurations:
-
-python train_cnn3-4_resnet34.py
-python train_cnn3-5_resnet18.py
-python train_cnn3-6_resnet18.py
-
-Summary
-
-The workflow consists of four main phases:
-
-Sentinel-2 preparation (metadata download, scene selection, and indexing)
-
-AIS data preparation (download, parsing, and spatial processing)
-
-AIS–Sentinel matching and patch generation
-
-Dataset cleaning and CNN model training
-
-This pipeline enables the creation of a large-scale, reproducible dataset for ship type classification using Sentinel-2 imagery and AIS-derived vessel labels.
+- AIS provider endpoints, file naming conventions, and availability may change over time.
+- Copernicus Data Space and Sentinel Hub APIs (OAuth/token endpoints, Catalog/STAC responses, pagination format) may evolve.
+- If requests start failing (401/403/5xx/400), review:
+  - credentials in `config.yaml`
+  - API endpoints (`sentinel_hub.auth_url`, `sentinel_hub.catalog_url`)
+  - pagination logic and required request parameters
+  - rate limits / service incidents
+- This repository prioritizes reproducibility, but maintenance updates may be required to keep integrations working.
