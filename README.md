@@ -714,3 +714,161 @@ python train_cnn3-6_resnet18.py   # 6-class setup, ResNet-18
     -rate limits / service incidents
 
 -This repository prioritizes reproducibility, but maintenance updates may be required to keep integrations working.
+
+End-to-End Processing Workflow
+
+This section describes the complete workflow used to construct the training dataset and train the ship classification models.
+All steps can be executed using the main.py command-line interface together with the SQL scripts provided in the sql/ directory.
+
+The workflow integrates Sentinel-2 imagery, AIS vessel messages, and PostGIS spatial processing to generate labeled image patches for ship type classification.
+
+1. Download Sentinel-2 Metadata
+
+First, Sentinel-2 metadata records covering the study area and time period are downloaded and stored in the PostgreSQL/PostGIS database.
+
+python main.py --config config.yaml s2.metadata-download
+2. Compute Scene Geometry and Water Area
+
+Scene footprints are generated and the open-water area within each Sentinel-2 scene is calculated.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sentinel2_metadata_geom_and_water_area.sql
+3. Select Sentinel-2 Scenes
+
+Scenes suitable for analysis are selected based on predefined criteria (e.g., cloud coverage and water area).
+
+This step creates a new table containing the selected scenes.
+
+python main.py --config config.yaml s2.select-file \
+  --sql-file sql/sentinel2_meta_select.sql
+4. Download Selected Sentinel-2 Images
+
+The selected Sentinel-2 products are downloaded from the Copernicus Data Space and uploaded to the configured S3 bucket.
+
+python main.py --config config.yaml s2.download \
+  --table sentinel2_meta_selected \
+  --column api_id
+5. Build Sentinel-2 Download Index
+
+An index table describing the downloaded Sentinel-2 products is created.
+
+python main.py --config config.yaml s2.build-download-index \
+  --table sentinel_download_index
+6. Generate Geometry for Download Index
+
+Scene geometries are added to the download index table.
+
+python main.py --config config.yaml s2.build-download-index-geom \
+  --sql-file sql/create-sentinel_download_index_geom.sql
+7. Determine Required AIS Files
+
+AIS archives corresponding to the Sentinel-2 acquisition dates are identified.
+
+python main.py --config config.yaml ais.build-list \
+  --sql-file sql/create_ais_download_list.sql
+8. Download AIS Archives
+
+AIS archives are downloaded and stored in the configured S3 bucket.
+
+python main.py --config config.yaml ais.download \
+  --table ais_download_list \
+  --date-col date
+9. Parse AIS Data
+
+AIS ZIP archives stored in S3 are parsed and inserted into the PostgreSQL database.
+
+python main.py --config config.yaml ais.parse-s3 \
+  --table ship_raw_data \
+  --start-date 2024-01-01 \
+  --end-date 2025-01-01
+10. Create AIS Point Geometry
+
+AIS latitude and longitude values are converted into PostGIS point geometries.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_point_geom.sql
+11. Create Sentinel-2 Sensing Time
+
+Sentinel-2 sensing timestamps are generated and standardized.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_sensing_time_without_tz.sql
+12. Create Spatial and Temporal Indexes
+
+Indexes are created to improve spatial and temporal query performance.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_index_sentinel.sql
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_index_ais1.sql
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_index_ais2.sql
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_index_ais3.sql
+13. Compute Closest AIS Timestamps
+
+AIS messages closest to each Sentinel-2 sensing time are identified.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_closest_timestamp_with_time_filter.sql
+14. Create Ship Prediction Points
+
+Estimated vessel positions at Sentinel-2 acquisition times are calculated.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_prediction_point_table.sql
+15. Filter Open-Sea Prediction Points
+
+Only vessels located in open water are retained.
+
+python main.py --config config.yaml db.exec-sql \
+  --sql-file sql/sql_create_prediction_point_open_sea.sql
+16. Generate Sentinel-2 Image Patches
+
+Image patches centered on predicted ship locations are extracted from Sentinel-2 scenes.
+
+python main.py --config config.yaml patches.build \
+  --table public.ship_prediction_point_open_sea \
+  --patch-size-px 128 \
+  --bands B02 B03 B04 B08 \
+  --save-tci
+17. Reorganize Patch Dataset by Ship Type
+
+The generated patches are reorganized into ship-type-based folder structures.
+
+python main.py --config config.yaml patches.rebucket
+18. Remove Cloudy Image Patches
+
+Cloud-contaminated patches are detected and removed from the dataset.
+
+python utils/clean_cloudy_s3.py
+19. Train the Classification Model
+
+The CNN model is trained using the generated Sentinel-2 patch dataset.
+
+Example training command:
+
+python train_cnn3-4_resnet18.py
+
+Alternative model configurations:
+
+python train_cnn3-4_resnet34.py
+python train_cnn3-5_resnet18.py
+python train_cnn3-6_resnet18.py
+
+Summary
+
+The workflow consists of four main phases:
+
+Sentinel-2 preparation (metadata download, scene selection, and indexing)
+
+AIS data preparation (download, parsing, and spatial processing)
+
+AIS–Sentinel matching and patch generation
+
+Dataset cleaning and CNN model training
+
+This pipeline enables the creation of a large-scale, reproducible dataset for ship type classification using Sentinel-2 imagery and AIS-derived vessel labels.
